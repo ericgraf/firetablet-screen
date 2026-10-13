@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MotionWake</string>
+    <string name="notif_body">Watching camera — screen sleeps after idle.</string>
+    <string name="notif_body_big">Watching the camera. The screen sleeps after the idle timeout and wakes on motion.</string>
+    <string name="action_wake">Wake</string>
+    <string name="action_sleep">Sleep</string>
+    <string name="action_stop">Stop</string>
+    <string name="running">running</string>
+    <string name="stopped">stopped</string>
+    <string name="idle">Idle: %1$d s</string>
+    <string name="last_motion">Last motion: %1$d s ago</string>
+    <string name="no_motion_yet">no motion detected yet</string>
+    <string name="idle_minutes">Idle timeout (minutes)</string>
+    <string name="threshold">Motion threshold (0.5–15)</string>
+    <string name="button_start">Start</string>
+    <string name="button_stop">Stop</string>
+    <string name="button_wake">Wake now</string>
+    <string name="button_sleep">Sleep now</string>
+    <string name="button_apply">Apply</string>
+    <string name="auto_start">Start after boot</string>
+    <string name="applied">Settings applied</string>
+    <string name="invalid_idle">Idle must be 1–1440 minutes</string>
+    <string name="invalid_threshold">Threshold must be 0.5–15</string>
+</resources>
