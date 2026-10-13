@@ -33,6 +33,7 @@ public final class MainActivity extends Activity {
     private TextView mStatus;
     private EditText mIdleInput;
     private EditText mThresholdInput;
+    private EditText mCheckInput;
     private CheckBox mAutoStart;
 
     private final Handler mPoll = new Handler(Looper.getMainLooper());
@@ -84,7 +85,7 @@ public final class MainActivity extends Activity {
                         } catch (Exception ignored) {
                         }
                     }
-                }),
+                })),
                 lp(LinearLayout.LayoutParams.MATCH_PARENT,
                         LinearLayout.LayoutParams.WRAP_CONTENT, dp(8)));
 
@@ -121,6 +122,15 @@ public final class MainActivity extends Activity {
                 MotionWakeService.DEFAULT_THRESHOLD);
         mThresholdInput.setText(formatNumber(thInitial));
         root.addView(mThresholdInput, lp(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(4)));
+
+        mCheckInput = new EditText(this);
+        mCheckInput.setHint(R.string.check_seconds);
+        mCheckInput.setSingleLine(true);
+        long checkInitial = prefs().getLong(MotionWakeService.PREF_CHECK_SECONDS,
+                MotionWakeService.DEFAULT_CHECK_SECONDS);
+        mCheckInput.setText(String.valueOf(checkInitial));
+        root.addView(mCheckInput, lp(LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, dp(4)));
 
         Button applyBtn = button(R.string.button_apply, new View.OnClickListener() {
@@ -161,6 +171,7 @@ public final class MainActivity extends Activity {
         boolean ok = true;
         long idle = parseLong(mIdleInput.getText().toString());
         float th = parseFloat(mThresholdInput.getText().toString());
+        long check = parseLong(mCheckInput.getText().toString());
         if (idle <= 0 || idle > 1440) {
             toast(R.string.invalid_idle);
             ok = false;
@@ -169,10 +180,16 @@ public final class MainActivity extends Activity {
             toast(R.string.invalid_threshold);
             ok = false;
         }
+        if (check < MotionWakeService.MIN_CHECK_SECONDS
+                || check > MotionWakeService.MAX_CHECK_SECONDS) {
+            toast(R.string.invalid_check);
+            ok = false;
+        }
         if (ok) {
             prefs().edit()
                     .putLong(MotionWakeService.PREF_IDLE_MINUTES, idle)
                     .putFloat(MotionWakeService.PREF_THRESHOLD, th)
+                    .putLong(MotionWakeService.PREF_CHECK_SECONDS, check)
                     .apply();
             toast(R.string.applied);
         }

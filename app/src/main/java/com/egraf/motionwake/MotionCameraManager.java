@@ -1,15 +1,21 @@
 /*
- * MotionCameraManager — Camera2 preview pipeline for motion detection.
+ * MotionCameraManager — duty-cycled Camera2 motion detection (power saver).
  *
- * Opens the back camera (front as fallback) at a small YUV_420_888 preview
- * size, downsamples each frame's luma plane to a fixed GRID_W x GRID_H
- * grid, and flags "motion" when the mean absolute difference between
- * successive frames stays at/above the threshold for CONFIRM_FRAMES
- * consecutive processed frames.
+ * Instead of holding a continuous preview (which keeps the sensor and DSP
+ * running 24/7 and warms the tablet), short check cycles are run:
  *
- * All Camera2 callbacks run on a dedicated HandlerThread. Open failures
- * (permission not granted yet, device busy, ...) are retried with
- * backoff: 2s, then x1.6 up to 15s.
+ *   open camera → small preview session → wait for auto-exposure to settle
+ *   → grab one still → close the camera → compare with the previous check
+ *   → wait the check interval (default 4 s, configurable 2–30 s) → repeat.
+ *
+ * Camera on-time per cycle ≈ 1–2 s against an off period of several seconds,
+ * so the sensor is on ~25–40% of the time instead of 100%. Motion = the mean
+ * absolute luma difference versus the previous check at/above the threshold
+ * for CONFIRM_CYCLES consecutive checks (after WARMUP_CYCLES warm-up checks
+ * while auto-exposure settles). Failed checks (camera busy, timeouts) pace
+ * the next check in with backoff.
+ *
+ * All Camera2 callbacks run on one dedicated HandlerThread.
  */
 package com.egraf.motionwake;
 
@@ -27,14 +33,12 @@ import android.media.Image;
 import android.media.ImageReader;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.os.SystemClock;
 import android.util.Log;
 import android.util.Range;
 import android.util.Size;
 
 import java.util.Collections;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
+import java.util.Locale;
 
 final class MotionCameraManager {
 
@@ -44,19 +48,29 @@ final class MotionCameraManager {
 
     private static final String TAG = "MotionCamera";
 
-    // Luma grid used for frame differencing (multiple of 4 on both axes).
+    // check cadence (power saving)
+    static final long DEFAULT_INTERVAL_MS = 4000L;
+    private static final long MIN_INTERVAL_MS = 2000L;
+    private static final long MAX_INTERVAL_MS = 30000L;
+    // per-cycle timing
+    private static final long SETTLE_MS = 1000L;      // auto-exposure settling before the grab
+    private static final long OPEN_TIMEOUT_MS = 2000L;
+    private static final long CONFIG_TIMEOUT_MS = 2500L;
+    // failure pacing: retry sooner than the normal interval, capped
+    private static final long FAIL_BASE_MS = 2000L;
+    private static final long FAIL_MAX_MS = 15000L;
+    private static final float FAIL_BACKOFF = 1.6f;
+    // motion decision
+    private static final int CONFIRM_CYCLES = 2;
+    private static final int WARMUP_CYCLES = 2;
+    // luma grid for differencing (multiple of 4 on both axes)
     private static final int GRID_W = 96;
     private static final int GRID_H = 72;
-    // Consecutive frames over threshold before declaring motion.
-    private static final int CONFIRM_FRAMES = 2;
-    // Ignore first frames while the image signal settles.
-    private static final int WARMUP_FRAMES = 5;
-    // Cap processing rate — the camera delivers far more frames than needed.
-    private static final long MIN_FRAME_INTERVAL_MS = 100;
 
-    private static final long MIN_RETRY_MS = 2000L;
-    private static final long MAX_RETRY_MS = 15000L;
-    private static final float BACKOFF = 1.6f;
+    private static final int PHASE_IDLE = 0;
+    private static final int PHASE_OPEN = 1;
+    private static final int PHASE_CONFIG = 2;
+    private static final int PHASE_SETTLE = 3;
 
     private final Context mApp;
     private final MotionListener mListener;
@@ -64,22 +78,45 @@ final class MotionCameraManager {
     private HandlerThread mThread;
     private Handler mHandler;
     private CameraManager mCameraManager;
-    private String mCameraId;
+
+    private volatile boolean mRunning = false;
+    private volatile long mIntervalMs = DEFAULT_INTERVAL_MS;
+    private volatile float mThreshold = MotionWakeService.DEFAULT_THRESHOLD;
+    private int mPhase = PHASE_IDLE; // camera thread only
+
+    // decision state — camera thread only
+    private int mCycleCount;
+    private int mConfirmed;
+    private float[] mPrevGrid;
+    private int mFailCount;
+
+    // in-flight resources — camera thread only
     private CameraDevice mDevice;
     private CameraCaptureSession mSession;
     private ImageReader mReader;
 
-    private final Semaphore mOpenLock = new Semaphore(1);
-    private volatile boolean mRunning = false;
-    private volatile float mThreshold = MotionWakeService.DEFAULT_THRESHOLD;
-    private volatile boolean mRetrying = false;
-    private long mRetryDelayMs = MIN_RETRY_MS;
+    // per-phase timeout guards — posted/removed on the camera handler only
+    private final Runnable mOpenTimeout = new Runnable() {
+        @Override
+        public void run() {
+            if (mPhase == PHASE_OPEN) {
+                Log.w(TAG, "cycle: camera open timeout");
+                closeCameraInternal();
+                failCycle("open timeout");
+            }
+        }
+    };
 
-    // Differencing state — only touched on the camera handler thread.
-    private float[] mPrevGrid;
-    private int mConfirmed;
-    private int mFramesSeen;
-    private long mNextProcessAt;
+    private final Runnable mConfigTimeout = new Runnable() {
+        @Override
+        public void run() {
+            if (mPhase == PHASE_CONFIG) {
+                Log.w(TAG, "cycle: session configure timeout");
+                closeCameraInternal();
+                failCycle("configure timeout");
+            }
+        }
+    };
 
     MotionCameraManager(Context app, MotionListener listener) {
         mApp = app.getApplicationContext();
@@ -94,24 +131,32 @@ final class MotionCameraManager {
         mThreshold = threshold;
     }
 
+    long getIntervalMs() {
+        return mIntervalMs;
+    }
+
+    void setIntervalMs(long v) {
+        mIntervalMs = Math.max(MIN_INTERVAL_MS, Math.min(MAX_INTERVAL_MS, v));
+    }
+
     synchronized void start() {
         if (mRunning) {
             return;
         }
         mRunning = true;
-        mRetrying = false;
-        mRetryDelayMs = MIN_RETRY_MS;
-        mPrevGrid = null;
+        mCycleCount = 0;
         mConfirmed = 0;
-        mFramesSeen = 0;
+        mPrevGrid = null;
+        mFailCount = 0;
+        mPhase = PHASE_IDLE;
         mThread = new HandlerThread("motionwatch-camera");
         mThread.start();
         mHandler = new Handler(mThread.getLooper());
         mCameraManager = (CameraManager) mApp.getSystemService(Context.CAMERA_SERVICE);
-        postCamera(new Runnable() {
+        post(new Runnable() {
             @Override
             public void run() {
-                openCameraInternal();
+                beginCycle();
             }
         });
     }
@@ -121,214 +166,287 @@ final class MotionCameraManager {
             return;
         }
         mRunning = false;
-        mRetrying = false;
-        closeCameraInternal();
+        // quitSafely still runs the pending cycle messages, which close the
+        // camera cleanly, then the thread exits.
         if (mThread != null) {
             mThread.quitSafely();
             try {
-                mThread.join(2000L);
+                mThread.join(3000L);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
-            mThread = null;
-            mHandler = null;
         }
+        closeCameraInternal();
+        mThread = null;
+        mHandler = null;
+        mPhase = PHASE_IDLE;
     }
 
-    private void postCamera(Runnable r) {
-        Handler h = mHandler;
-        if (h != null) {
-            h.post(r);
-        }
-    }
+    // ------------------------------------------------------------------ cycle
 
-    // Runs on the camera handler thread.
-    private void openCameraInternal() {
+    // Runs on the camera handler thread — one step of the state machine.
+    private void beginCycle() {
         if (!mRunning) {
+            return;
+        }
+        if (mPhase != PHASE_IDLE) {
+            scheduleNext();
             return;
         }
         if (mApp.checkSelfPermission(Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
-            scheduleRetry("CAMERA permission not granted yet");
+            failCycle("CAMERA permission not granted yet");
+            return;
+        }
+        if (mCameraManager == null) {
+            failCycle("camera manager missing");
             return;
         }
         String id;
         try {
             id = pickCameraId();
         } catch (CameraAccessException e) {
-            scheduleRetry("camera enumeration failed");
+            failCycle("camera enumeration failed");
             return;
         }
         if (id == null) {
-            scheduleRetry("no usable camera found");
+            failCycle("no usable camera found");
             return;
         }
-        mCameraId = id;
-
-        if (!mOpenLock.tryAcquire()) {
-            scheduleRetry("camera open lock busy");
-            return;
-        }
+        final String cameraId = id;
+        mPhase = PHASE_OPEN;
+        mHandler.postDelayed(mOpenTimeout, OPEN_TIMEOUT_MS);
         try {
-            mCameraManager.openCamera(mCameraId, new CameraDevice.StateCallback() {
+            mCameraManager.openCamera(cameraId, new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(CameraDevice camera) {
+                    if (mPhase != PHASE_OPEN) {
+                        camera.close();
+                        return;
+                    }
+                    mHandler.removeCallbacks(mOpenTimeout);
                     mDevice = camera;
-                    unlockCamera();
-                    mRetryDelayMs = MIN_RETRY_MS;
-                    postCamera(new Runnable() {
-                        @Override
-                        public void run() {
-                            configureSession();
-                        }
-                    });
+                    configureSession();
                 }
 
                 @Override
                 public void onDisconnected(CameraDevice camera) {
-                    unlockCamera();
-                    if (camera != null) {
-                        camera.close();
-                    }
-                    if (mDevice == camera) {
-                        mDevice = null;
-                    }
-                    if (mSession != null) {
-                        try {
-                            mSession.close();
-                        } catch (Exception ignored) {
-                        }
-                        mSession = null;
-                    }
-                    scheduleRetry("camera disconnected");
+                    failPhaseCallback("camera disconnected");
                 }
 
                 @Override
                 public void onError(CameraDevice camera, int error) {
-                    unlockCamera();
-                    if (camera != null) {
-                        camera.close();
-                    }
-                    if (mDevice == camera) {
-                        mDevice = null;
-                    }
-                    scheduleRetry("camera error " + error);
+                    failPhaseCallback("camera error " + error);
                 }
             }, mHandler);
         } catch (CameraAccessException e) {
-            unlockCamera();
             Log.w(TAG, "openCamera failed", e);
-            scheduleRetry("openCamera exception");
-        }
-    }
-
-    /** Releases the camera-open lock at most once (callbacks can fire late). */
-    private void unlockCamera() {
-        if (!mOpenLock.tryRelease()) {
-            // Already released — expected on late-disconnect paths.
+            closeCameraInternal();
+            failCycle("openCamera exception");
         }
     }
 
     // Runs on the camera handler thread.
     private void configureSession() {
-        if (!mRunning || mDevice == null) {
+        if (mPhase != PHASE_OPEN || mDevice == null) {
             return;
         }
+        int[] wh;
         try {
-            int[] wh = pickYuvSize(mCameraId);
-            int w = wh[0];
-            int h = wh[1];
-            mReader = ImageReader.newInstance(w, h, ImageFormat.YUV_420_888, 3);
-            mReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
-                @Override
-                public void onImageAvailable(ImageReader reader) {
-                    Image image = reader.acquireLatestImage();
-                    if (image == null) {
-                        return;
-                    }
-                    try {
-                        processFrame(image);
-                    } finally {
-                        image.close();
-                    }
-                }
-            }, mHandler);
-
+            wh = pickYuvSize();
+        } catch (CameraAccessException e) {
+            closeCameraInternal();
+            failCycle("size lookup failed");
+            return;
+        }
+        final int w = wh[0];
+        final int h = wh[1];
+        mPhase = PHASE_CONFIG;
+        mHandler.postDelayed(mConfigTimeout, CONFIG_TIMEOUT_MS);
+        try {
+            mReader = ImageReader.newInstance(w, h, ImageFormat.YUV_420_888, 4);
             CaptureRequest.Builder builder =
                     mDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
-            builder.addTarget(mReader);
+            builder.addTarget(mReader.getSurface());
             builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
-            builder.set(CaptureRequest.CONTROL_SCENE_MODE, 0); // MANUAL
             try {
                 builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, new Range<>(10, 30));
             } catch (IllegalArgumentException ignored) {
             }
-
+            final CaptureRequest request = builder.build();
             mDevice.createCaptureSession(
-                    Collections.singletonList(mReader),
+                    Collections.singletonList(mReader.getSurface()),
                     new CameraCaptureSession.StateCallback() {
                         @Override
                         public void onConfigured(CameraCaptureSession session) {
-                            if (!mRunning) {
+                            if (mPhase != PHASE_CONFIG) {
+                                session.close();
                                 return;
                             }
+                            mHandler.removeCallbacks(mConfigTimeout);
                             mSession = session;
                             try {
-                                session.setRepeatingRequest(builder.build(), null, mHandler);
-                                mConfirmed = 0;
-                                mFramesSeen = 0;
-                                mPrevGrid = null;
-                                Log.i(TAG, "camera ready (" + w + "x" + h + ")");
+                                session.setRepeatingRequest(request, null, mHandler);
                             } catch (Exception e) {
-                                Log.w(TAG, "setRepeatingRequest failed", e);
-                                scheduleRetry("repeating request failed");
+                                closeCameraInternal();
+                                failCycle("setRepeatingRequest failed");
+                                return;
                             }
+                            // Let auto-exposure settle, then grab one still.
+                            mPhase = PHASE_SETTLE;
+                            mHandler.postDelayed(new Runnable() {
+                                @Override
+                                public void run() {
+                                    if (mPhase != PHASE_SETTLE) {
+                                        return;
+                                    }
+                                    Image image = mReader != null
+                                            ? mReader.acquireLatestImage() : null;
+                                    float[] grid = null;
+                                    if (image != null) {
+                                        try {
+                                            grid = extractGrid(image);
+                                        } catch (Exception e) {
+                                            Log.w(TAG, "grab failed", e);
+                                        } finally {
+                                            image.close();
+                                        }
+                                    }
+                                    closeCameraInternal();
+                                    succeedCycle(grid);
+                                }
+                            }, SETTLE_MS);
                         }
 
                         @Override
                         public void onConfigureFailed(CameraCaptureSession session) {
-                            scheduleRetry("session configure failed");
+                            if (mPhase == PHASE_CONFIG) {
+                                closeCameraInternal();
+                                failCycle("session configure failed");
+                            } else {
+                                session.close();
+                            }
                         }
                     },
                     mHandler);
         } catch (Exception e) {
             Log.w(TAG, "configureSession failed", e);
-            scheduleRetry("configureSession exception");
+            closeCameraInternal();
+            failCycle("configureSession exception");
         }
     }
 
-    // Runs on the camera handler thread.
-    private void processFrame(Image image) {
-        long now = SystemClock.elapsedRealtime();
-        if (now < mNextProcessAt) {
+    /** Camera disconnected/error during open/config — settle phase owns itself. */
+    private void failPhaseCallback(String reason) {
+        if (mPhase == PHASE_SETTLE || mPhase == PHASE_IDLE) {
             return;
         }
-        mNextProcessAt = now + MIN_FRAME_INTERVAL_MS;
+        closeCameraInternal();
+        failCycle(reason);
+    }
 
-        float[] grid = extractGrid(image);
-        mFramesSeen++;
-        if (mPrevGrid == null || mFramesSeen <= WARMUP_FRAMES) {
+    private void succeedCycle(float[] grid) {
+        if (grid == null) {
+            failCycle("no image grabbed");
+            return;
+        }
+        mFailCount = 0;
+        mCycleCount++;
+        if (mCycleCount <= WARMUP_CYCLES) {
             mPrevGrid = grid;
-            return;
-        }
-        long sum = 0;
-        for (int i = 0; i < grid.length; i++) {
-            sum += Math.round(Math.abs(grid[i] - mPrevGrid[i]));
-        }
-        float meanDiff = (float) sum / grid.length;
-        if (meanDiff >= mThreshold) {
-            mConfirmed++;
-            if (mConfirmed >= CONFIRM_FRAMES) {
-                mConfirmed = 0;
-                mListener.onMotionDetected();
-            }
         } else {
-            mConfirmed = 0;
+            if (mPrevGrid != null) {
+                float diff = meanAbsDiff(grid, mPrevGrid);
+                Log.d(TAG, String.format(Locale.US, "cycle %d diff=%.2f thr=%.1f",
+                        mCycleCount, diff, mThreshold));
+                if (diff >= mThreshold) {
+                    mConfirmed++;
+                    if (mConfirmed >= CONFIRM_CYCLES) {
+                        mConfirmed = 0;
+                        Log.i(TAG, "MOTION DETECTED (diff="
+                                + String.format(Locale.US, "%.2f", diff) + ")");
+                        mListener.onMotionDetected();
+                    }
+                } else {
+                    mConfirmed = 0;
+                }
+            }
+            mPrevGrid = grid;
         }
-        mPrevGrid = grid;
+        mPhase = PHASE_IDLE;
+        scheduleNext();
     }
 
-    // Runs on the camera handler thread.
+    private void failCycle(String reason) {
+        mFailCount++;
+        Log.w(TAG, "cycle failed (" + reason + "), retry # " + mFailCount);
+        mPhase = PHASE_IDLE;
+        scheduleNext();
+    }
+
+    private void scheduleNext() {
+        if (!mRunning) {
+            return;
+        }
+        long delay;
+        if (mFailCount == 0) {
+            delay = mIntervalMs;
+        } else {
+            long d = FAIL_BASE_MS;
+            for (int i = 1; i < mFailCount && d < FAIL_MAX_MS; i++) {
+                d = Math.min(FAIL_MAX_MS, (long) (d * FAIL_BACKOFF));
+            }
+            delay = Math.min(mIntervalMs, d);
+        }
+        mHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                beginCycle();
+            }
+        }, delay);
+    }
+
+    // ---------------------------------------------------------------- helpers
+
+    private void post(Runnable r) {
+        Handler h = mHandler;
+        if (h != null) {
+            h.post(r);
+        }
+    }
+
+    private void closeCameraInternal() {
+        if (mSession != null) {
+            try {
+                mSession.close();
+            } catch (Exception ignored) {
+            }
+            mSession = null;
+        }
+        if (mReader != null) {
+            try {
+                mReader.close();
+            } catch (Exception ignored) {
+            }
+            mReader = null;
+        }
+        if (mDevice != null) {
+            try {
+                mDevice.close();
+            } catch (Exception ignored) {
+            }
+            mDevice = null;
+        }
+    }
+
+    private static float meanAbsDiff(float[] a, float[] b) {
+        long sum = 0;
+        for (int i = 0; i < a.length; i++) {
+            sum += Math.round(Math.abs(a[i] - b[i]));
+        }
+        return (float) sum / a.length;
+    }
+
     private float[] extractGrid(Image image) {
         Image.Plane plane = image.getPlanes()[0]; // Y plane
         java.nio.ByteBuffer buffer = plane.getBuffer();
@@ -374,87 +492,32 @@ final class MotionCameraManager {
         return fallback;
     }
 
-    private int[] pickYuvSize(String id) throws CameraAccessException {
-        CameraCharacteristics ch = mCameraManager.getCameraCharacteristics(id);
-        Size[] sizes = null;
-        if (ch != null) {
-            android.util.SizeMap map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            if (map != null) {
-                sizes = map.getOutputSizes(ImageFormat.YUV_420_888);
-            }
-        }
-        if (sizes != null && sizes.length > 0) {
-            Size best = null;
-            long bestArea = Long.MAX_VALUE;
-            // Prefer the smallest size that still covers the grid: fast + enough detail.
-            for (Size s : sizes) {
-                if (s.getWidth() < GRID_W || s.getHeight() < GRID_H) {
-                    continue;
+    private int[] pickYuvSize() throws CameraAccessException {
+        String[] ids = mCameraManager.getCameraIdList();
+        String id = ids != null && ids.length > 0 ? ids[0] : null;
+        if (id != null) {
+            CameraCharacteristics ch = mCameraManager.getCameraCharacteristics(id);
+            android.hardware.camera2.params.StreamConfigurationMap map =
+                    ch != null ? ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) : null;
+            Size[] sizes = map != null ? map.getOutputSizes(ImageFormat.YUV_420_888) : null;
+            if (sizes != null && sizes.length > 0) {
+                Size best = null;
+                long bestArea = Long.MAX_VALUE;
+                for (Size s : sizes) {
+                    if (s.getWidth() < GRID_W || s.getHeight() < GRID_H) {
+                        continue;
+                    }
+                    long area = (long) s.getWidth() * (long) s.getHeight();
+                    if (best == null || area < bestArea) {
+                        best = s;
+                        bestArea = area;
+                    }
                 }
-                long area = (long) s.getWidth() * (long) s.getHeight();
-                if (best == null || area < bestArea) {
-                    best = s;
-                    bestArea = area;
+                if (best != null) {
+                    return new int[]{best.getWidth(), best.getHeight()};
                 }
-            }
-            if (best != null) {
-                return new int[]{best.getWidth(), best.getHeight()};
             }
         }
         return new int[]{640, 480};
-    }
-
-    private void scheduleRetry(String reason) {
-        if (!mRunning) {
-            return;
-        }
-        if (mRetrying) {
-            return;
-        }
-        mRetrying = true;
-        long delay = mRetryDelayMs;
-        mRetryDelayMs = Math.min(MAX_RETRY_MS, (long) (mRetryDelayMs * BACKOFF));
-        Log.w(TAG, "camera retry in " + delay + "ms: " + reason);
-        final Handler h = mHandler;
-        if (h == null) {
-            mRetrying = false;
-            return;
-        }
-        h.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                if (!mRunning) {
-                    mRetrying = false;
-                    return;
-                }
-                mRetrying = false;
-                closeCameraInternal();
-                openCameraInternal();
-            }
-        }, delay);
-    }
-
-    private void closeCameraInternal() {
-        if (mSession != null) {
-            try {
-                mSession.close();
-            } catch (Exception ignored) {
-            }
-            mSession = null;
-        }
-        if (mReader != null) {
-            try {
-                mReader.close();
-            } catch (Exception ignored) {
-            }
-            mReader = null;
-        }
-        if (mDevice != null) {
-            try {
-                mDevice.close();
-            } catch (Exception ignored) {
-            }
-            mDevice = null;
-        }
     }
 }

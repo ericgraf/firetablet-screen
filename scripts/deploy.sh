@@ -39,12 +39,17 @@ adb -s "$SERIAL" install -r "$APK"
 
 echo "==> Granting runtime permissions"
 adb -s "$SERIAL" shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+# DEVICE_POWER is signature|privileged — used for IPowerManager.goToSleep()
+adb -s "$SERIAL" shell pm grant "$PKG" android.permission.DEVICE_POWER 2>/dev/null || true
+# WRITE_SETTINGS appop — lets the app toggle screen_off_timeout to trigger sleep
+adb -s "$SERIAL" shell appops set "$PKG" WRITE_SETTINGS allow 2>/dev/null || true
 
 echo
-echo "Installed. Useful commands:"
+echo "Installed. Useful commands ($(echo -n "am broadcast -a <ACTION> -n $PKG/.ControlReceiver" | head -c 60)...):"
+echo
 echo "  start monitor : adb -s $SERIAL shell am start-foreground-service -n $PKG/.MotionWakeService"
-echo "  stop monitor  : adb -s $SERIAL shell am broadcast -a com.egraf.motionwake.action.STOP_SERVICE"
-echo "  wake screen   : adb -s $SERIAL shell am broadcast -a com.egraf.motionwake.action.WAKE"
-echo "  sleep screen  : adb -s $SERIAL shell am broadcast -a com.egraf.motionwake.action.SLEEP"
+echo "  stop monitor  : adb -s $SERIAL shell am broadcast -a com.egraf.motionwake.action.STOP_SERVICE -n $PKG/.ControlReceiver"
+echo "  wake screen   : adb -s $SERIAL shell am broadcast -a com.egraf.motionwake.action.WAKE -n $PKG/.ControlReceiver"
+echo "  sleep screen  : adb -s $SERIAL shell am broadcast -a com.egraf.motionwake.action.SLEEP -n $PKG/.ControlReceiver"
 echo "  open app      : adb -s $SERIAL shell am start -n $PKG/.MainActivity"
 echo "  logs          : adb -s $SERIAL logcat | grep -E 'MotionWake|MotionCamera|ScreenControl|ControlReceiver'"

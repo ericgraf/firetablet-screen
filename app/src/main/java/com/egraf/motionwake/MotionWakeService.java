@@ -34,12 +34,16 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     public static final String PREFS_NAME = "motionwatch";
     public static final String PREF_IDLE_MINUTES = "idle_minutes";
     public static final String PREF_THRESHOLD = "threshold";
+    public static final String PREF_CHECK_SECONDS = "check_seconds";
     public static final String PREF_AUTO_START = "auto_start";
 
     public static final float DEFAULT_THRESHOLD = 3f;
     public static final float MIN_THRESHOLD = 0.5f;
     public static final float MAX_THRESHOLD = 15f;
     public static final long DEFAULT_IDLE_MINUTES = 10;
+    public static final long DEFAULT_CHECK_SECONDS = 4L;
+    public static final long MIN_CHECK_SECONDS = 2L;
+    public static final long MAX_CHECK_SECONDS = 30L;
 
     public static final String ACTION_START = "com.egraf.motionwake.action.START_SERVICE";
     public static final String ACTION_STOP = "com.egraf.motionwake.action.STOP_SERVICE";
@@ -91,16 +95,35 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         super.onCreate();
         mPower = (PowerManager) getSystemService(Context.POWER_SERVICE);
         mPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        mPrefs.edit()
-                .putDefault(PREF_IDLE_MINUTES, DEFAULT_IDLE_MINUTES)
-                .putDefault(PREF_THRESHOLD, DEFAULT_THRESHOLD)
-                .putDefault(PREF_AUTO_START, true)
-                .commit();
+        SharedPreferences.Editor editor = mPrefs.edit();
+        if (!mPrefs.contains(PREF_IDLE_MINUTES)) {
+            editor.putLong(PREF_IDLE_MINUTES, DEFAULT_IDLE_MINUTES);
+        }
+        if (!mPrefs.contains(PREF_THRESHOLD)) {
+            editor.putFloat(PREF_THRESHOLD, DEFAULT_THRESHOLD);
+        }
+        if (!mPrefs.contains(PREF_CHECK_SECONDS)) {
+            editor.putLong(PREF_CHECK_SECONDS, DEFAULT_CHECK_SECONDS);
+        }
+        if (!mPrefs.contains(PREF_AUTO_START)) {
+            editor.putBoolean(PREF_AUTO_START, true);
+        }
+        editor.commit();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent != null ? intent.getAction() : null;
+
+        // One-shot override for testing the idle pipeline:
+        //   am start-foreground-service -n com.egraf.motionwake/.MotionWakeService \
+        //       --el idle_minutes_override 1
+        if (intent != null && intent.hasExtra("idle_minutes_override")
+                && !ACTION_STOP.equals(action)) {
+            long minutes = intent.getLongExtra("idle_minutes_override", DEFAULT_IDLE_MINUTES);
+            mPrefs.edit().putLong(PREF_IDLE_MINUTES, minutes).apply();
+            mIdleMs = idleMsFromPrefs(mPrefs);
+        }
 
         if (ACTION_STOP.equals(action)) {
             Log.i(TAG, "STOP action — shutting down");
@@ -165,6 +188,9 @@ public final class MotionWakeService extends Service implements MotionCameraMana
                 return; // already running
             }
             mStopped = false;
+            // Start the idle clock now — the timeout counts from when monitoring
+            // begins (motion detection hasn't seen anything yet in this process).
+            sLastMotionAt = SystemClock.elapsedRealtime();
             applyPrefs();
             if (mPrefListener == null) {
                 mPrefListener = new SharedPreferences.OnSharedPreferenceChangeListener() {
@@ -177,6 +203,10 @@ public final class MotionWakeService extends Service implements MotionCameraMana
                             }
                         } else if (PREF_IDLE_MINUTES.equals(key)) {
                             mIdleMs = idleMsFromPrefs(prefs);
+                        } else if (PREF_CHECK_SECONDS.equals(key)) {
+                            if (mCamera != null) {
+                                mCamera.setIntervalMs(checkSecondsFromPrefs(prefs) * 1000L);
+                            }
                         }
                     }
                 };
@@ -187,6 +217,7 @@ public final class MotionWakeService extends Service implements MotionCameraMana
             mCamera = new MotionCameraManager(this, this);
             mCamera.setThreshold(clamp(mPrefs.getFloat(PREF_THRESHOLD, DEFAULT_THRESHOLD),
                     MIN_THRESHOLD, MAX_THRESHOLD));
+            mCamera.setIntervalMs(checkSecondsFromPrefs(mPrefs) * 1000L);
             mCamera.start();
         }
         if (mTick == null) {
@@ -194,7 +225,8 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         }
         mTick.post(mTickRunnable);
         sRunning = true;
-        Log.i(TAG, "monitor started (idle=" + (mIdleMs / 60000) + "min, threshold=" + mCamera.getThreshold() + ")");
+        Log.i(TAG, "monitor started (idle=" + (mIdleMs / 60000) + "min, threshold="
+                + mCamera.getThreshold() + ", check=" + mCamera.getIntervalMs() / 1000 + "s)");
     }
 
     private void stopMonitoring() {
@@ -229,6 +261,12 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         long minutes = prefs.getLong(PREF_IDLE_MINUTES, DEFAULT_IDLE_MINUTES);
         minutes = Math.max(1L, Math.min(minutes, 1440L));
         return minutes * 60 * 1000L;
+    }
+
+    static long checkSecondsFromPrefs(SharedPreferences prefs) {
+        long seconds = prefs.getLong(PREF_CHECK_SECONDS, DEFAULT_CHECK_SECONDS);
+        seconds = Math.max(MIN_CHECK_SECONDS, Math.min(seconds, MAX_CHECK_SECONDS));
+        return seconds;
     }
 
     private void tickOnce() {

@@ -4,6 +4,12 @@ Sideloadable app for Amazon Fire tablets: the tablet sleeps its screen after
 **10 minutes without camera-detected motion**, and wakes the screen when motion
 is detected again. Runs as a foreground service; restarts itself after boot.
 
+Power-saving design: the camera is **not** held open continuously. Each check
+cycle opens the camera for ~1–2 s, grabs a single still after auto-exposure
+settles, and closes it again — then waits the check interval (default **4 s**,
+configurable 2–30 s). That keeps the sensor/duty at roughly 25–40% of a
+continuous preview, so the tablet stays much cooler and draws less battery.
+
 ```
 app/                    Android app (com.egraf.motionwake)
   src/main/java/...     service, camera motion detector, screen controller, UI
@@ -63,35 +69,83 @@ androidx.core 1.13.1 (only library dependency).
 
 ## Controlling it
 
-| Action          | Command (adb shell)                                                            |
-|-----------------|--------------------------------------------------------------------------------|
-| Start monitor   | `am start-foreground-service -n com.egraf.motionwake/.MotionWakeService`      |
-| Stop monitor    | `am broadcast -a com.egraf.motionwake.action.STOP_SERVICE`                     |
-| Wake screen now | `am broadcast -a com.egraf.motionwake.action.WAKE`                             |
-| Sleep screen    | `am broadcast -a com.egraf.motionwake.action.SLEEP`                            |
-| App UI          | `am start -n com.egraf.motionwake/.MainActivity`                               |
+| Action          | Command (adb shell)                                                                                        |
+|-----------------|------------------------------------------------------------------------------------------------------------|
+| Start monitor   | `am start-foreground-service -n com.egraf.motionwake/.MotionWakeService`                                   |
+| Stop monitor    | `am broadcast -a com.egraf.motionwake.action.STOP_SERVICE -n com.egraf.motionwake/.ControlReceiver`        |
+| Wake screen now | `am broadcast -a com.egraf.motionwake.action.WAKE -n com.egraf.motionwake/.ControlReceiver`                |
+| Sleep screen    | `am broadcast -a com.egraf.motionwake.action.SLEEP -n com.egraf.motionwake/.ControlReceiver`               |
+| App UI          | `am start -n com.egraf.motionwake/.MainActivity`                                                           |
+
+> The `.ControlReceiver` component must be named in the broadcast (`-n ...`) —
+> Fire OS drops *implicit* broadcasts to background apps.
 
 The notification exposes **Wake / Sleep / Stop** actions, and the app UI shows
 live status plus tunables.
 
 ## Tunables (app UI, or `motionwatch` SharedPreferences)
 
-| Key            | Default | Meaning                                   |
-|----------------|---------|-------------------------------------------|
-| `idle_minutes` | `10`    | screen sleeps after this much no-motion   |
-| `threshold`    | `3.0`   | min mean luma-frame difference (0.5–15) — lower = more sensitive |
-| `auto_start`   | `true`  | restart the monitor after boot            |
+| Key             | Default | Meaning                                   |
+|-----------------|---------|-------------------------------------------|
+| `idle_minutes`  | `10`    | screen sleeps after this much no-motion   |
+| `threshold`     | `3.0`   | min mean luma difference per check (0.5–15) — lower = more sensitive |
+| `check_seconds` | `4`     | camera check cadence in seconds (2–30); larger = more power saving |
+| `auto_start`    | `true`  | restart the monitor after boot            |
 
 ## How motion detection works
 
-Camera2 rear camera (front fallback) at the smallest supported YUV size,
-frames throttled to ≤10 fps, luma plane downsampled to a 96×72 grid; motion =
-mean absolute frame-to-frame difference ≥ threshold for 2 consecutive frames
-(after 5 warm-up frames). Camera failures retry with 2 s → 15 s backoff.
+Camera2 rear camera (front fallback) in **duty-cycled check mode**: every
+`check_seconds`, the app opens the camera at the smallest supported YUV
+size, lets auto-exposure settle (~1 s), grabs one still, and closes the
+camera again before the next check. Each still's luma plane is downsampled
+to a 96×72 grid and compared with the previous check; motion = the mean
+absolute difference ≥ `threshold` on 2 consecutive checks (the first 2
+checks after start are warm-up and discarded while exposure settles).
+Checking 2–30 s apart is actually *better* for detection than frame-by-frame
+diffing — a scene change has more time to develop, and the static-scene
+noise floor is tiny (a handless room measures ~0.1–0.3 against the 3.0
+default, so there's plenty of headroom). Failed checks (camera held by
+another app, timeouts) pace in with a 2 s → 15 s backoff and are skipped —
+they never produce a false motion event.
 
-Screen sleep uses `PowerManager.goToSleep()` (WAKE_LOCK permission) with a raw
-KEY_SLEEP input-event fallback; wake uses `ACQUIRE_CAUSES_WAKEUP` full wake
-lock with a KEY_WAKEUP fallback.
+`dumpsys media.camera` shows the camera disconnected between checks, which
+is the power-saver property to verify.
+
+## Screen sleep / wake on Fire OS
+
+Plain `PowerManager.goToSleep()` needs `DEVICE_POWER` (signature|privileged),
+which a regular sideloaded app can't hold — on this Fire build both
+`goToSleep` and `wakeUp` are present on `IPowerManager` but still
+permission-gated. What actually works:
+
+- **Sleep** — the app holds the `WRITE_SETTINGS` appop (granted by
+  `deploy.sh`, or manually:
+  `adb shell appops set com.egraf.motionwake WRITE_SETTINGS allow`), drops
+  `Settings.System.screen_off_timeout` (Fire ships it at **10 days**!) to
+  5 s, lets the framework's own bedtime timer do the actual sleep, then
+  restores the original value. Binder `goToSleep()` and a KEY_SLEEP
+  input-event are tried first and used as fallbacks.
+- **Wake** — a `FULL_WAKE_LOCK | ACQUIRE_CAUSES_WAKEUP` lock (only needs
+  `WAKE_LOCK`), with binder `wakeUp()` and KEY_WAKEUP input-event as
+  fallbacks.
+
+**`pm install -r` resets appops**, so the `WRITE_SETTINGS` grant must be
+re-applied after *every* install. `scripts/deploy.sh` does this
+automatically; if you `adb install` by hand, re-run the `appops` command
+or sleeps will fall back to the slower/less reliable paths.
+
+## Testing hooks & logs
+
+- Fast idle test: `am start-foreground-service -n com.egraf.motionwake/.MotionWakeService
+  --el idle_minutes_override 1` (1-minute timeout; the value is written to
+  prefs, so restart the service normally afterwards to get it back).
+- Per-check diagnostics: logcat line `cycle N diff=X.XX thr=3.0` — use it
+  to tune `threshold` against your scene (static scene ≈ 0.1–0.3, a face or
+  hand easily 5–30+).
+- The Fully launcher (screensaver/camera home, `de.ozerov.fully`) holds the
+  front camera and a wake lock; since Fire's HAL allows one concurrent
+  camera, checks may fail until Fully releases it — the app then retries
+  automatically on the next cycle.
 
 ## Verify on device
 
@@ -99,8 +153,11 @@ lock with a KEY_WAKEUP fallback.
 adb logcat -c
 adb shell am start-foreground-service -n com.egraf.motionwake/.MotionWakeService
 adb logcat | grep -E "MotionWakeService|MotionCamera|ScreenControl"
-# expect: "monitor started (idle=10min, threshold=3.0)" + "camera ready (WxH)"
-# wave something in front of the camera → "motion ..." lines appear when screen is off
+# expect: "monitor started (idle=10min, threshold=3.0, check=4s)"
+#        + repeated "cycle N diff=0.xx thr=3.0" (static scene) every ~4 s
+# move in front of the rear camera → "MOTION DETECTED (diff=...)" and, when
+# the screen is asleep, "motion while screen off — waking display"
+# between checks: `adb shell dumpsys media.camera` shows us disconnected
 ```
 
 ## Notes

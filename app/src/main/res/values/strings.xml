@@ -13,6 +13,7 @@
     <string name="no_motion_yet">no motion detected yet</string>
     <string name="idle_minutes">Idle timeout (minutes)</string>
     <string name="threshold">Motion threshold (0.5–15)</string>
+    <string name="check_seconds">Motion check interval (seconds, 2–30)</string>
     <string name="button_start">Start</string>
     <string name="button_stop">Stop</string>
     <string name="button_wake">Wake now</string>
@@ -22,4 +23,5 @@
     <string name="applied">Settings applied</string>
     <string name="invalid_idle">Idle must be 1–1440 minutes</string>
     <string name="invalid_threshold">Threshold must be 0.5–15</string>
+    <string name="invalid_check">Check interval must be 2–30 seconds</string>
 </resources>
