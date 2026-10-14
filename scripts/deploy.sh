@@ -63,6 +63,19 @@ adb -s "$SERIAL" shell cmd package set-home-activity --user 0 "$PKG/.DashboardBr
 #   adb shell pm enable com.baronkiko.launcherhijacl
 adb -s "$SERIAL" shell pm disable-user --user 0 com.baronkiko.launcherhijacl 2>/dev/null || true
 
+echo "==> Dismissing the system keyguard (one-time)"
+# While the keyguard is up its window pins the display's screen-off timeout
+# to 10 s, and it reappears after every screen-off timeout. One genuine
+# user dismissal (swipe up) makes the off-reason "user" and it stays
+# dismissed across sleep cycles. requestDismissKeyguard() itself is gated
+# behind Amazon's signature permission, so a real swipe is the reliable way.
+adb -s "$SERIAL" shell input keyevent 224 >/dev/null 2>&1 || true
+sleep 1
+adb -s "$SERIAL" shell input swipe 640 750 640 100 200 >/dev/null 2>&1 || true
+sleep 1
+KG_STATE="$(adb -s "$SERIAL" shell dumpsys window 2>/dev/null | grep -A13 'KeyguardServiceDelegate' | grep -E 'showing=' | head -1 | tr -d ' ')"
+echo "    keyguard now: ${KG_STATE:-unknown}"
+
 echo
 echo "Installed. Useful commands ($(echo -n "am broadcast -a <ACTION> -n $PKG/.ControlReceiver" | head -c 60)...):"
 echo

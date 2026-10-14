@@ -63,6 +63,15 @@
             android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!-- Transparent helper: requestDismissKeyguard on wake (see
+             KeyguardDismissing). -->
+        <activity
+            android:name=".KeyguardDismissing"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <!-- Invisible springboard used at boot to start the foreground
              service (see BootStarter / BootReceiver). -->
         <activity

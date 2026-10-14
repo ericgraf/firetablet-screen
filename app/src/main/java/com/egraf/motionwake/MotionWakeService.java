@@ -122,6 +122,31 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         // lives, whether or not the camera monitor is running.
         mApi = new ApiServer(this);
         mApi.start();
+
+        // Kiosk: keep the system keyguard off while we're device admin.
+        // On this Fire build the keyguard reappears after every screen-off
+        // timeout; while it's up it pins the display's screen-off timeout to
+        // 10 s (its window's userActivityTimeout) and leaves our activity
+        // stopped behind it — a state the camera policy rejects.
+        ensureKeyguardDisabled();
+    }
+
+    private void ensureKeyguardDisabled() {
+        try {
+            android.app.admin.DevicePolicyManager dpm =
+                    (android.app.admin.DevicePolicyManager)
+                            getSystemService(Context.DEVICE_POLICY_SERVICE);
+            android.content.ComponentName admin =
+                    new android.content.ComponentName(this, MwDeviceAdmin.class);
+            if (dpm != null && dpm.isAdminActive(admin)) {
+                // Idempotent; cheap enough to run on every service start
+                // (covers the "admin was (re)set" and boot cases).
+                boolean ok = dpm.setKeyguardDisabled(admin, true);
+                Log.i(TAG, "setKeyguardDisabled -> " + ok);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "keyguard disable failed", e);
+        }
     }
 
     @Override
@@ -549,6 +574,9 @@ public final class MotionWakeService extends Service implements MotionCameraMana
      * a fresh dashboard). Returns true if launch was issued.
      */
     public boolean openDashboard(boolean reload) {
+        // Wake path: if the system keyguard came up after the last sleep,
+        // dismiss it (it also pins the screen-off timeout to 10 s while up).
+        dismissKeyguard();
         String url = mPrefs.getString(PREF_BROWSER_URL, "");
         if (url == null || url.length() == 0) {
             Log.i(TAG, "openDashboard: no dashboard URL stored — skipped");
@@ -571,6 +599,17 @@ public final class MotionWakeService extends Service implements MotionCameraMana
                 "--es", "com.egraf.motionwake.extra.URL", url,
                 "--ez", "com.egraf.motionwake.extra.RELOAD",
                 reload ? "true" : "false"}) == 0;
+    }
+
+    /** Fire the transparent keyguard-dismiss activity (no-op if not up). */
+    private void dismissKeyguard() {
+        try {
+            Intent dismiss = new Intent(this, KeyguardDismissing.class);
+            dismiss.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(dismiss);
+        } catch (Exception e) {
+            Log.w(TAG, "keyguard dismiss launch failed", e);
+        }
     }
 
     private boolean openInBrowser(String url) {

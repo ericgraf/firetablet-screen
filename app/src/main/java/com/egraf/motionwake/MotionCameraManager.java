@@ -21,6 +21,7 @@ package com.egraf.motionwake;
 
 import android.Manifest;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.ImageFormat;
 import android.hardware.camera2.CameraAccessException;
@@ -160,6 +161,11 @@ final class MotionCameraManager {
                 // UIDs the system considers idle (screen off + no visible
                 // activity) — make sure our override is in place first.
                 CameraUidPolicy.ensureActive(mApp);
+                // The same policy also refuses UIDs without a visible
+                // foreground activity. At boot the service starts in the
+                // background, before home resolves — bring the dashboard
+                // (our home activity) up so the camera can connect.
+                bringDashboardToFront("monitor start");
                 beginCycle();
             }
         });
@@ -390,8 +396,39 @@ final class MotionCameraManager {
             // inside ensureActive() to once per 5s.
             CameraUidPolicy.ensureActive(mApp);
         }
+        if ((reason.startsWith("openCamera") || reason.startsWith("camera "))
+                && (mFailCount == 5 || mFailCount % 15 == 0)) {
+            // "disabled by policy": our UID has no visible foreground
+            // activity (service started in the background at boot, or
+            // another app took the screen over). Bring the dashboard —
+            // our home activity — back to the front so the camera can
+            // connect. Relaunch is cheap (singleTask, reused in place).
+            bringDashboardToFront(reason);
+        }
         mPhase = PHASE_IDLE;
         scheduleNext();
+    }
+
+    /**
+     * Bring the kiosk dashboard to the front. This Fire build's
+     * background-camera policy refuses camera connects for UIDs without a
+     * visible activity, so a foreground instance of our own activity is
+     * what actually unblocks the sensor (the set-uid-state override alone
+     * did not). Safe from any thread; no-op-ish when already on top.
+     */
+    private void bringDashboardToFront(String why) {
+        if (!mRunning) {
+            return;
+        }
+        Log.i(TAG, "self-heal: bringing dashboard to front (" + why + ")");
+        try {
+            Intent intent = new Intent(mApp, DashboardBrowser.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            mApp.startActivity(intent);
+        } catch (Exception e) {
+            Log.w(TAG, "self-heal dashboard launch failed", e);
+        }
     }
 
     private void scheduleNext() {

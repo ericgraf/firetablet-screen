@@ -14,6 +14,7 @@
 package com.egraf.motionwake;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -107,6 +108,26 @@ public class DashboardBrowser extends Activity {
         if (url != null && url.length() > 0) {
             Log.i(TAG, "loading " + url);
             mWeb.loadUrl(url);
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // If the system keyguard ever shows over us (screen-off/timeout
+        // cycle), ask it to go away — no-op when it isn't showing. The
+        // primary fix is the device-admin keyguard-disable in
+        // MotionWakeService; this covers the boot/early windows.
+        // (Partial-API note: isKeyguardShowing() isn't in our android.jar,
+        // so skip the state query and just request.)
+        try {
+            android.app.KeyguardManager km =
+                    (android.app.KeyguardManager)
+                            getSystemService(Context.KEYGUARD_SERVICE);
+            if (km != null) {
+                km.requestDismissKeyguard(this, null);
+            }
+        } catch (Exception ignored) {
         }
     }
 
