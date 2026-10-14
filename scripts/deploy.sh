@@ -43,6 +43,14 @@ adb -s "$SERIAL" shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS 2>/
 adb -s "$SERIAL" shell pm grant "$PKG" android.permission.DEVICE_POWER 2>/dev/null || true
 # WRITE_SETTINGS appop — lets the app toggle screen_off_timeout to trigger sleep
 adb -s "$SERIAL" shell appops set "$PKG" WRITE_SETTINGS allow 2>/dev/null || true
+# SAF — Fire OS BAL exemption: lets the KeyInjector activity start from the
+# foreground service (needed to inject KEYCODE_SLEEP without INJECT_EVENTS).
+adb -s "$SERIAL" shell pm grant "$PKG" android.permission.SYSTEM_ALERT_WINDOW 2>/dev/null || true
+adb -s "$SERIAL" shell appops set "$PKG" SYSTEM_ALERT_WINDOW allow 2>/dev/null || true
+# INJECT_EVENTS (signature) — direct InputManager key injection fallback.
+adb -s "$SERIAL" shell pm grant "$PKG" android.permission.INJECT_EVENTS 2>/dev/null || true
+# Fire OS custom permission: direct BAL exemption for the injector activity.
+adb -s "$SERIAL" shell pm grant "$PKG" android.permission.START_ACTIVITIES_FROM_BACKGROUND 2>/dev/null || true
 
 echo
 echo "Installed. Useful commands ($(echo -n "am broadcast -a <ACTION> -n $PKG/.ControlReceiver" | head -c 60)...):"

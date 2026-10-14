@@ -40,6 +40,11 @@ android {
     buildTypes {
         debug {
             minifyEnabled false
+            // Same key as release so install -r between them keeps data/token.
+            def p = loadSignProps()
+            if (p['storeFile'] != null) {
+                signingConfig signingConfigs.release
+            }
         }
         release {
             minifyEnabled true

@@ -27,6 +27,9 @@ import android.util.Log;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.ServiceCompat;
 
+import java.security.SecureRandom;
+import java.util.Locale;
+
 public final class MotionWakeService extends Service implements MotionCameraManager.MotionListener {
 
     public static final String TAG = "MotionWakeService";
@@ -36,6 +39,7 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     public static final String PREF_THRESHOLD = "threshold";
     public static final String PREF_CHECK_SECONDS = "check_seconds";
     public static final String PREF_AUTO_START = "auto_start";
+    public static final String PREF_API_TOKEN = "api_token";
 
     public static final float DEFAULT_THRESHOLD = 3f;
     public static final float MIN_THRESHOLD = 0.5f;
@@ -66,9 +70,9 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     private Handler mTick;
     private SharedPreferences mPrefs;
     private SharedPreferences.OnSharedPreferenceChangeListener mPrefListener;
-    private long mIdleMs = DEFAULT_IDLE_MINUTES * 60 * 1000L;
+    private volatile long mIdleMs = DEFAULT_IDLE_MINUTES * 60 * 1000L;
+    private ApiServer mApi;
     private volatile boolean mForegroundStarted;
-    private volatile boolean mStopped;
 
     private final Runnable mTickRunnable = new Runnable() {
         @Override
@@ -96,6 +100,9 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         mPower = (PowerManager) getSystemService(Context.POWER_SERVICE);
         mPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         SharedPreferences.Editor editor = mPrefs.edit();
+        if (!mPrefs.contains(PREF_API_TOKEN)) {
+            editor.putString(PREF_API_TOKEN, generateApiToken());
+        }
         if (!mPrefs.contains(PREF_IDLE_MINUTES)) {
             editor.putLong(PREF_IDLE_MINUTES, DEFAULT_IDLE_MINUTES);
         }
@@ -109,6 +116,11 @@ public final class MotionWakeService extends Service implements MotionCameraMana
             editor.putBoolean(PREF_AUTO_START, true);
         }
         editor.commit();
+
+        // Local HTTP API (Home Assistant / curl). Stays up while the service
+        // lives, whether or not the camera monitor is running.
+        mApi = new ApiServer(this);
+        mApi.start();
     }
 
     @Override
@@ -157,6 +169,10 @@ public final class MotionWakeService extends Service implements MotionCameraMana
 
     @Override
     public void onDestroy() {
+        if (mApi != null) {
+            mApi.stop();
+            mApi = null;
+        }
         stopMonitoring();
         super.onDestroy();
     }
@@ -184,10 +200,9 @@ public final class MotionWakeService extends Service implements MotionCameraMana
 
     private void startMonitoring() {
         synchronized (mStateLock) {
-            if (mStopped || mCamera != null) {
+            if (mCamera != null) {
                 return; // already running
             }
-            mStopped = false;
             // Start the idle clock now — the timeout counts from when monitoring
             // begins (motion detection hasn't seen anything yet in this process).
             sLastMotionAt = SystemClock.elapsedRealtime();
@@ -231,7 +246,6 @@ public final class MotionWakeService extends Service implements MotionCameraMana
 
     private void stopMonitoring() {
         synchronized (mStateLock) {
-            mStopped = true;
             if (mTick != null) {
                 mTick.removeCallbacks(mTickRunnable);
             }
@@ -297,6 +311,392 @@ public final class MotionWakeService extends Service implements MotionCameraMana
             Log.i(TAG, "motion while screen off — waking display");
             new ScreenController(this).wake();
         }
+    }
+
+    // ------------------------------------------------------------ HTTP API
+
+    /** Current state + settings (ApiServer GET /status, /status). */
+    public String statusJson() {
+        long lastAge = 0L;
+        long wall = sLastMotionWall;
+        if (wall > 0) {
+            lastAge = Math.max(0L, System.currentTimeMillis() - wall);
+        }
+        return "{"
+                + "\"ok\":true,"
+                + "\"app\":\"motionwake\","
+                + "\"running\":" + sRunning + ","
+                + "\"screen_on\":" + isInteractive() + ","
+                + "\"idle_ms\":" + sIdleMs + ","
+                + "\"idle_limit_ms\":" + mIdleMs + ","
+                + "\"last_motion_age_ms\":" + lastAge + ","
+                + "\"idle_minutes\":" + idleMinutesFromPrefs(mPrefs) + ","
+                + "\"threshold\":" + jsonNumber(
+                        mPrefs.getFloat(PREF_THRESHOLD, DEFAULT_THRESHOLD)) + ","
+                + "\"check_seconds\":" + checkSecondsFromPrefs(mPrefs) + ","
+                + "\"port\":" + ApiServer.DEFAULT_PORT + ","
+                + "\"version\":\"" + versionNameJson() + "\""
+                + "}";
+    }
+
+    private String versionNameJson() {
+        try {
+            String name = getPackageManager()
+                    .getPackageInfo(getPackageName(), 0).versionName;
+            return (name == null || name.length() == 0) ? "1.0" : name;
+        } catch (Exception e) {
+            return "1.0";
+        }
+    }
+
+    /** Current settings only (ApiServer GET /settings, POST /settings echo). */
+    public String settingsJson() {
+        return "{"
+                + "\"ok\":true,"
+                + "\"idle_minutes\":" + idleMinutesFromPrefs(mPrefs) + ","
+                + "\"threshold\":" + jsonNumber(
+                        mPrefs.getFloat(PREF_THRESHOLD, DEFAULT_THRESHOLD)) + ","
+                + "\"check_seconds\":" + checkSecondsFromPrefs(mPrefs) + ","
+                + "\"auto_start\":" + mPrefs.getBoolean(PREF_AUTO_START, true)
+                + "}";
+    }
+
+    private long idleMinutesFromPrefs(SharedPreferences prefs) {
+        long minutes = prefs.getLong(PREF_IDLE_MINUTES, DEFAULT_IDLE_MINUTES);
+        return Math.max(1L, Math.min(minutes, 1440L));
+    }
+
+    private static String jsonNumber(double v) {
+        if (Double.isFinite(v) && v == Math.rint(v) && Math.abs(v) < 1e15) {
+            return String.valueOf((long) v);
+        }
+        return String.valueOf(v);
+    }
+
+    public String apiStart() {
+        ensureForeground();
+        startMonitoring();
+        return statusJson();
+    }
+
+    public String apiStop() {
+        stopMonitoring();
+        return statusJson();
+    }
+
+    /** Toggle — rest_switch compatibility (HA's rest platform posts to the same URL). */
+    public String apiToggle() {
+        if (sRunning) {
+            stopMonitoring();
+        } else {
+            ensureForeground();
+            startMonitoring();
+        }
+        return statusJson();
+    }
+
+    public String apiShutdown() {
+        stopMonitoring();
+        try {
+            stopForeground(true);
+        } catch (Exception ignored) {
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                stopSelf();
+            }
+        }, "motionwatch-shutdown").start();
+        return "{\"ok\":true,\"running\":false}";
+    }
+
+    public String apiWake() {
+        touchMotion();
+        java.util.concurrent.Future<?> f = new ScreenController(this).wakeFuture();
+        try {
+            f.get(8000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Exception ignored) {
+        }
+        return statusJson();
+    }
+
+    public String apiSleep() {
+        // The WRITE_SETTINGS timeout path can take up to ~20 s; bound the wait.
+        java.util.concurrent.Future<?> f = new ScreenController(this).sleepFuture();
+        try {
+            f.get(25000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Exception ignored) {
+        }
+        return statusJson();
+    }
+
+    /**
+     * Accepts a flat JSON body with a subset of
+     * {"idle_minutes":n,"threshold":f,"check_seconds":n}; applies the
+     * present-and-valid keys. Returns settingsJson() on success.
+     */
+    public String apiSetSettings(String json) {
+        Double idle = numFromJson(json, "idle_minutes");
+        Double threshold = numFromJson(json, "threshold");
+        Double check = numFromJson(json, "check_seconds");
+        if (idle == null && threshold == null && check == null) {
+            return "{\"ok\":false,\"error\":\"no recognized keys "
+                    + "(idle_minutes, threshold, check_seconds)\"}";
+        }
+        boolean badRange = (idle != null && (idle < 1 || idle > 1440))
+                || (threshold != null && (threshold < MIN_THRESHOLD || threshold > MAX_THRESHOLD))
+                || (check != null && (check < MIN_CHECK_SECONDS || check > MAX_CHECK_SECONDS));
+        if (badRange) {
+            return "{\"ok\":false,\"error\":\"value out of range "
+                    + "(idle 1-1440, threshold " + MIN_THRESHOLD + "-" + MAX_THRESHOLD
+                    + ", check " + MIN_CHECK_SECONDS + "-" + MAX_CHECK_SECONDS + ")\"}";
+        }
+        SharedPreferences.Editor editor = mPrefs.edit();
+        if (idle != null) {
+            editor.putLong(PREF_IDLE_MINUTES, idle.longValue());
+        }
+        if (threshold != null) {
+            editor.putFloat(PREF_THRESHOLD, threshold.floatValue());
+        }
+        if (check != null) {
+            editor.putLong(PREF_CHECK_SECONDS, check.longValue());
+        }
+        editor.apply();
+        return settingsJson();
+    }
+
+    // ------------------------------------------------------------ browser
+
+    public static final String PREF_BROWSER_URL = "browser_url";
+
+    /** Current dashboard URL + which browser would open it (ApiServer GET /browser). */
+    public String browserJson() {
+        String url = mPrefs.getString(PREF_BROWSER_URL, "");
+        String pkg = defaultBrowserPackage();
+        return "{"
+                + "\"ok\":true,"
+                + "\"url\":\"" + jsonEscape(url) + "\","
+                + "\"browser\":\"" + jsonEscape(pkg == null ? "" : pkg) + "\""
+                + "}";
+    }
+
+    /**
+     * Set the dashboard URL ({"url":"..."}, optional) and open it in the
+     * tablet's default browser. Returns the browser state.
+     */
+    public String apiBrowser(String bodyJson) {
+        String url = strFromJson(bodyJson, "url");
+        if (url != null && url.length() > 0) {
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                url = "https://" + url;
+            }
+            mPrefs.edit().putString(PREF_BROWSER_URL, url).apply();
+        }
+        url = mPrefs.getString(PREF_BROWSER_URL, "");
+        boolean opened = openInBrowser(url);
+        return "{"
+                + "\"ok\":" + (url.length() > 0) + ","
+                + "\"opened\":" + opened + ","
+                + "\"url\":\"" + jsonEscape(url) + "\","
+                + "\"browser\":\"" + jsonEscape(defaultBrowserPackage() == null ? ""
+                        : defaultBrowserPackage()) + "\""
+                + "}";
+    }
+
+    /** Re-open the stored dashboard URL in the default browser (reload). */
+    public String apiBrowserReload() {
+        String url = mPrefs.getString(PREF_BROWSER_URL, "");
+        if (url.length() == 0) {
+            return "{\"ok\":false,\"error\":\"no dashboard URL stored yet "
+                    + "(POST /browser {url})\"}";
+        }
+        boolean opened = openInBrowser(url);
+        return "{"
+                + "\"ok\":true,"
+                + "\"opened\":" + opened + ","
+                + "\"url\":\"" + jsonEscape(url) + "\""
+                + "}";
+    }
+
+    private String defaultBrowserPackage() {
+        try {
+            Intent probe = new Intent(Intent.ACTION_VIEW);
+            probe.setData(android.net.Uri.parse("https://www.home-assistant.io/"));
+            android.content.pm.ResolveInfo ri =
+                    getPackageManager().resolveActivity(probe, 0);
+            return (ri != null && ri.activityInfo != null) ? ri.activityInfo.packageName : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean openInBrowser(String url) {
+        if (url == null || url.length() == 0) {
+            return false;
+        }
+        try {
+            Intent intent = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+            Log.i(TAG, "browser open " + url + " -> startActivity issued");
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "browser startActivity failed", e);
+        }
+        // Fallback: shell am (works from the shell uid; silent-fails in app
+        // uid on this Fire build, so it's the last resort).
+        return execSimple(new String[]{"am", "start", "--user", "0",
+                "-a", "android.intent.action.VIEW", "-d", url}) == 0;
+    }
+
+    private static int execSimple(String[] cmd) {
+        try {
+            Process p = Runtime.getRuntime().exec(cmd);
+            java.io.InputStream stdout = p.getInputStream();
+            byte[] buf = new byte[256];
+            while (stdout.read(buf) > 0) {
+                // drain
+            }
+            return p.waitFor();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return -1;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private static String jsonEscape(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"':
+                    sb.append("\\\"");
+                    break;
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format(Locale.US, "\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Minimal flat-JSON string extractor for the API (value stays a bare string). */
+    private static String strFromJson(String json, String key) {
+        if (json == null) {
+            return null;
+        }
+        String needle = "\"" + key + "\"";
+        int i = json.indexOf(needle);
+        if (i < 0) {
+            return null;
+        }
+        i = skipWs(json, i + needle.length());
+        int n = json.length();
+        if (i >= n || json.charAt(i) != ':') {
+            return null;
+        }
+        i = skipWs(json, i + 1);
+        if (i >= n || json.charAt(i) != '"') {
+            return null;
+        }
+        int end = i + 1;
+        StringBuilder sb = new StringBuilder();
+        while (end < n) {
+            char c = json.charAt(end);
+            if (c == '\\' && end + 1 < n) {
+                char next = json.charAt(end + 1);
+                if (next == '"' || next == '\\' || next == 'n' || next == 'r' || next == 't') {
+                    sb.append(next == 'n' ? '\n' : next == 'r' ? '\r'
+                            : next == 't' ? '\t' : next);
+                    end += 2;
+                    continue;
+                }
+            }
+            if (c == '"') {
+                return sb.toString();
+            }
+            sb.append(c);
+            end++;
+        }
+        return null;
+    }
+
+    /** Minimal flat-JSON number extractor for the API (values are plain numbers). */
+    private static Double numFromJson(String json, String key) {
+        if (json == null) {
+            return null;
+        }
+        String needle = "\"" + key + "\"";
+        int i = json.indexOf(needle);
+        if (i < 0) {
+            return null;
+        }
+        i += needle.length();
+        int n = json.length();
+        i = skipWs(json, i);
+        if (i >= n || json.charAt(i) != ':') {
+            return null;
+        }
+        i = skipWs(json, i + 1);
+        int start = i;
+        while (i < n) {
+            char c = json.charAt(i);
+            if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E') {
+                i++;
+            } else {
+                break;
+            }
+        }
+        if (i == start) {
+            return null;
+        }
+        try {
+            return Double.valueOf(json.substring(start, i));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static int skipWs(String s, int i) {
+        while (i < s.length()
+                && (s.charAt(i) == ' ' || s.charAt(i) == '\t' || s.charAt(i) == '\n' || s.charAt(i) == '\r')) {
+            i++;
+        }
+        return i;
+    }
+
+    // ------------------------------------------------------------ API token
+
+    public String getApiToken() {
+        return mPrefs.getString(PREF_API_TOKEN, "");
+    }
+
+    public static String generateApiToken() {
+        SecureRandom rnd = new SecureRandom();
+        byte[] bytes = new byte[16];
+        rnd.nextBytes(bytes);
+        StringBuilder sb = new StringBuilder(32);
+        for (byte b : bytes) {
+            sb.append(String.format(Locale.US, "%02x", b));
+        }
+        return sb.toString();
     }
 
     private void createChannel() {

@@ -5,16 +5,23 @@
  * Sleep (tried in order):
  *   1. IPowerManager.goToSleep(long,int,int) via reflection — works when the
  *      DEVICE_POWER permission is granted (privileged/system installs).
- *   2. "Short screen_off_timeout" dance: WRITE_SETTINGS lets us lower the
+ *   2. KEYCODE_SLEEP via InputManager (needs INJECT_EVENTS; verified on this
+ *      Fire build to beat the Fully launcher's deprecated FULL_WAKE_LOCK).
+ *   3. "Short screen_off_timeout" dance: WRITE_SETTINGS lets us lower the
  *      system screen-off timeout to a few seconds and let PowerManagerService
- *      perform its own internal timeout sleep (no special permission needed,
- *      works on Fire OS / AOSP builds where DEVICE_POWER is unreachable).
- *   3. Raw KEY_SLEEP input-event injection (last resort; needs /dev/input).
+ *      perform its own internal timeout sleep (works when nobody holds a
+ *      deprecated full wake lock).
+ *   4. If the screen still stays on, a deprecated FULL_WAKE_LOCK is holding it
+ *      (on this tablet: the Fully launcher's "always on home"). Identify the
+ *      holder from `dumpsys power`, force-stop it, and retry step 3 (needs
+ *      the DUMP permission to read the holder).
+ *   5. Raw KEY_SLEEP input-event injection (last resort; needs /dev/input).
  *
  * Wake (tried in order):
  *   1. FULL_WAKE_LOCK with ACQUIRE_CAUSES_WAKEUP (only needs WAKE_LOCK).
  *   2. IPowerManager.wakeUp(...) via reflection (needs DEVICE_POWER).
- *   3. Raw KEY_WAKEUP input-event injection.
+ *   3. KEYCODE_WAKEUP via InputManager (needs INJECT_EVENTS).
+ *   4. Raw KEY_WAKEUP input-event injection.
  *
  * All work runs on a single background executor — safe from BroadcastReceiver
  * (main-thread) timeouts.
@@ -27,6 +34,7 @@ import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.KeyEvent;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -65,68 +73,260 @@ final class ScreenController {
         return mPower == null || mPower.isInteractive();
     }
 
+    private int mInjectSeq = 0;
+
+    /**
+     * Inject a key event on a transparent KeyInjector activity (InputManager
+     * allows injection without INJECT_EVENTS while our window is foreground).
+     * Returns true if the event pair was accepted.
+     */
+    private boolean injectKeycode(int keycode) {
+        final int seq = mInjectSeq++;
+        try {
+            android.content.Intent i = new android.content.Intent(mApp, KeyInjector.class);
+            i.putExtra("seq", seq);
+            i.putExtra("keycode", keycode);
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                    | android.content.Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+            // Start the injector task BEHIND the foreground task (see the
+            // note in KeyInjector.onCreate): Fire's focus walk then resolves
+            // to a NULL focus window while the injector is alive, and
+            // InputDispatcher accepts our events without INJECT_EVENTS.
+            // (setLaunchTaskBehind is @hide in the SDK stubs — reflect it.)
+            android.app.ActivityOptions opts = android.app.ActivityOptions.makeBasic();
+            try {
+                java.lang.reflect.Method m =
+                        android.app.ActivityOptions.class.getMethod("setLaunchTaskBehind", boolean.class);
+                opts = (android.app.ActivityOptions) m.invoke(opts, true);
+            } catch (Throwable ignored) {
+            }
+            mApp.startActivity(i, opts.toBundle());
+            // The activity retries injection until its window is top (<=3s).
+            long deadline = SystemClock.uptimeMillis() + 5000L;
+            while (SystemClock.uptimeMillis() < deadline) {
+                if (KeyInjector.isDone(seq)) {
+                    boolean ok = KeyInjector.resultOk(seq);
+                    Log.i(TAG, "inject keycode " + keycode + " via KeyInjector ok=" + ok);
+                    return ok;
+                }
+                Thread.sleep(50L);
+            }
+            Log.w(TAG, "inject keycode " + keycode + " timed out waiting for KeyInjector");
+            return false;
+        } catch (Exception e) {
+            Log.w(TAG, "inject keycode " + keycode + " failed", e);
+            return false;
+        }
+    }
+
     void wake() {
         EXEC.execute(new Runnable() {
             @Override
             public void run() {
-                boolean ok = acquireWakeLock();
-                if (!ok) {
-                    ok = binderWake();
-                }
-                if (!ok) {
-                    injectKey(SCAN_CODE_WAKEUP);
-                }
-                Log.i(TAG, "screen wake requested");
+                runWake();
             }
         });
+    }
+
+    /** Wake, returning a Future so callers (e.g. the HTTP API) can await completion. */
+    java.util.concurrent.Future<?> wakeFuture() {
+        return EXEC.submit(new Runnable() {
+            @Override
+            public void run() {
+                runWake();
+            }
+        });
+    }
+
+    private void runWake() {
+        boolean on = isScreenOn();
+        if (!on) {
+            acquireWakeLock();
+            SystemClock.sleep(150L);
+            on = isScreenOn();
+        }
+        if (!on) {
+            binderWake();
+            SystemClock.sleep(300L);
+            on = isScreenOn();
+        }
+        if (!on) {
+            if (injectKeycode(KeyEvent.KEYCODE_WAKEUP)) {
+                SystemClock.sleep(500L);
+            }
+            on = isScreenOn();
+        }
+        if (!on) {
+            injectKey(SCAN_CODE_WAKEUP);
+        }
+        Log.i(TAG, "screen wake requested (on=" + on + ")");
     }
 
     void sleep() {
         EXEC.execute(new Runnable() {
             @Override
             public void run() {
-                boolean ok = tryGoToSleep();
-                long originalTimeout = -1;
-                if (!ok) {
-                    try {
-                        ContentResolver cr = mApp.getContentResolver();
-                        originalTimeout = Settings.System.getInt(cr,
-                                Settings.System.SCREEN_OFF_TIMEOUT, 864000000);
-                    } catch (Throwable ignored) {
-                    }
-                }
-                if (!ok) {
-                    try {
-                        Settings.System.putInt(mApp.getContentResolver(),
-                                Settings.System.SCREEN_OFF_TIMEOUT, SLEEP_TIMEOUT_MS);
-                    } catch (Throwable t) {
-                        Log.d(TAG, "WRITE_SETTINGS timeout trick unavailable", t);
-                    }
-                }
-                if (!ok) {
-                    long deadline = SystemClock.uptimeMillis() + SLEEP_WAIT_DEADLINE_MS;
-                    while (SystemClock.uptimeMillis() < deadline) {
-                        if (!isScreenOn()) {
-                            ok = true;
-                            break;
-                        }
-                        SystemClock.sleep(250L);
-                    }
-                }
-                if (originalTimeout >= 0) {
-                    try {
-                        Settings.System.putInt(mApp.getContentResolver(),
-                                Settings.System.SCREEN_OFF_TIMEOUT, (int) originalTimeout);
-                    } catch (Throwable t) {
-                        Log.w(TAG, "could not restore screen_off_timeout", t);
-                    }
-                }
-                if (!ok) {
-                    injectKey(SCAN_CODE_SLEEP);
-                }
-                Log.i(TAG, "screen sleep requested (ok=" + ok + ")");
+                runSleep();
             }
         });
+    }
+
+    /** Sleep, returning a Future so callers (e.g. the HTTP API) can await completion. */
+    java.util.concurrent.Future<?> sleepFuture() {
+        return EXEC.submit(new Runnable() {
+            @Override
+            public void run() {
+                runSleep();
+            }
+        });
+    }
+
+    private void runSleep() {
+        boolean ok = !isScreenOn();
+        if (!ok) {
+            ok = tryGoToSleep();
+        }
+        if (!ok) {
+            // Verified on this Fire build: the forced-sleep key path also
+            // beats the launcher's deprecated FULL_WAKE_LOCK (Fully).
+            if (injectKeycode(KeyEvent.KEYCODE_SLEEP)) {
+                SystemClock.sleep(800L);
+                ok = !isScreenOn();
+            }
+        }
+        if (!ok) {
+            ok = timeoutTrickOnce();
+        }
+        if (!ok) {
+            // A deprecated FULL_WAKE_LOCK legitimately keeps the screen on
+            // (typical offender on this tablet: the Fully launcher, which uses
+            // it for its "always on" home). Kill the holder and retry the trick.
+            String victim = findFullWakeLockHolder();
+            if (victim != null) {
+                Log.i(TAG, "sleep: force-stopping FULL_WAKE_LOCK holder " + victim);
+                forceStopPackage(victim);
+                SystemClock.sleep(1000L); // let the holder release its locks
+                ok = timeoutTrickOnce();
+            }
+        }
+        if (!ok) {
+            injectKey(SCAN_CODE_SLEEP);
+        }
+        Log.i(TAG, "screen sleep requested (ok=" + ok + ")");
+    }
+
+    /** Briefly lower the system screen-off timeout, wait for the framework's
+     *  own timeline to sleep, and restore the original value. */
+    private boolean timeoutTrickOnce() {
+        long originalTimeout = -1;
+        boolean canTrick = true;
+        try {
+            originalTimeout = Settings.System.getInt(
+                    mApp.getContentResolver(), Settings.System.SCREEN_OFF_TIMEOUT, 864000000);
+        } catch (Throwable t) {
+            canTrick = false;
+            Log.d(TAG, "WRITE_SETTINGS timeout trick unavailable", t);
+        }
+        if (canTrick) {
+            try {
+                Settings.System.putInt(mApp.getContentResolver(),
+                        Settings.System.SCREEN_OFF_TIMEOUT, SLEEP_TIMEOUT_MS);
+            } catch (Throwable t) {
+                canTrick = false;
+                Log.d(TAG, "WRITE_SETTINGS timeout trick unavailable", t);
+            }
+        }
+        boolean slept = false;
+        if (canTrick) {
+            long deadline = SystemClock.uptimeMillis() + SLEEP_WAIT_DEADLINE_MS;
+            while (SystemClock.uptimeMillis() < deadline) {
+                if (!isScreenOn()) {
+                    slept = true;
+                    break;
+                }
+                SystemClock.sleep(250L);
+            }
+        }
+        if (originalTimeout >= 0) {
+            try {
+                Settings.System.putInt(mApp.getContentResolver(),
+                        Settings.System.SCREEN_OFF_TIMEOUT, (int) originalTimeout);
+            } catch (Throwable t) {
+                Log.w(TAG, "could not restore screen_off_timeout", t);
+            }
+        }
+        return slept;
+    }
+
+    /** The package holding a deprecated FULL_WAKE_LOCK, if any. */
+    private String findFullWakeLockHolder() {
+        String line = execShell("dumpsys power 2>/dev/null | grep -m1 'FULL_WAKE_LOCK'");
+        int i = line.indexOf("uid=");
+        if (i < 0) {
+            return null;
+        }
+        i += 4;
+        int end = i;
+        while (end < line.length() && Character.isDigit(line.charAt(end))) {
+            end++;
+        }
+        if (end == i) {
+            return null;
+        }
+        String uid = line.substring(i, end);
+        try {
+            if (Integer.parseInt(uid) == mApp.getApplicationInfo().uid) {
+                return null; // us — don't force-stop ourselves
+            }
+        } catch (Exception ignored) {
+        }
+        String pkg = execShell("pm list packages -U 2>/dev/null | grep -m1 'uid:" + uid
+                + "' | sed 's/package://' | cut -d' ' -f1");
+        if (pkg.length() < 4) {
+            return null;
+        }
+        if (pkg.equals(mApp.getPackageName())
+                || pkg.startsWith("android.")
+                || "com.amazon.platform".equals(pkg)) {
+            return null;
+        }
+        return pkg;
+    }
+
+    private void forceStopPackage(String pkg) {
+        forceStopPackageInternal(pkg);
+    }
+
+    private static void forceStopPackageInternal(String pkg) {
+        try {
+            int code = Runtime.getRuntime().exec(
+                    new String[]{"am", "force-stop", pkg}).waitFor();
+            Log.i(TAG, "force-stop " + pkg + " -> exit=" + code);
+        } catch (Exception e) {
+            Log.w(TAG, "force-stop " + pkg + " failed", e);
+        }
+    }
+
+    private static String execShell(String cmd) {
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd});
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[256];
+            int r;
+            while ((r = p.getInputStream().read(buf)) > 0) {
+                if (bos.size() < 4096) {
+                    bos.write(buf, 0, r);
+                }
+            }
+            try {
+                p.waitFor();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return bos.toString("UTF-8").trim();
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     // ------------------------------------------------------------------ wake

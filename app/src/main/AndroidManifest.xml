@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.DEVICE_POWER" />
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />
@@ -9,9 +10,31 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Inject KEYCODE_SLEEP/WAKEUP via InputManager (sleep beats launcher
+         full wake locks, wake is more reliable than /dev/input writes). -->
+    <uses-permission android:name="android.permission.INJECT_EVENTS" />
+    <!-- Dump PowerManagerService (find FULL_WAKE_LOCK holders, debug). -->
+    <uses-permission android:name="android.permission.DUMP" />
+    <!-- Needed for the background activity start (KeyInjector injection) to
+         be allowed: Fire's BAL exemption list checks this / the SAF appop. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.START_ACTIVITIES_FROM_BACKGROUND" />
 
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <!-- Resolve the default browser (dashboard URL, /browser endpoint).
+         Older platforms allow only one data scheme per intent, so split. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="http" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
+        </intent>
+    </queries>
 
     <application
         android:label="@string/app_name"
@@ -29,6 +52,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Transparent helper: injects KEYCODE_SLEEP/WAKEUP while our window
+             is foreground (InputManager allows that without INJECT_EVENTS). -->
+        <activity
+            android:name=".KeyInjector"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <service
             android:name=".MotionWakeService"

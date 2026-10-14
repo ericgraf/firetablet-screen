@@ -34,6 +34,8 @@ public final class MainActivity extends Activity {
     private EditText mIdleInput;
     private EditText mThresholdInput;
     private EditText mCheckInput;
+    private EditText mUrlInput;
+    private TextView mApiTokenView;
     private CheckBox mAutoStart;
 
     private final Handler mPoll = new Handler(Looper.getMainLooper());
@@ -133,6 +135,16 @@ public final class MainActivity extends Activity {
         root.addView(mCheckInput, lp(LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, dp(4)));
 
+        mUrlInput = new EditText(this);
+        mUrlInput.setHint(R.string.dashboard_url);
+        mUrlInput.setSingleLine(true);
+        String urlInitial = prefs().getString(MotionWakeService.PREF_BROWSER_URL, "");
+        if (urlInitial != null) {
+            mUrlInput.setText(urlInitial);
+        }
+        root.addView(mUrlInput, lp(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(4)));
+
         Button applyBtn = button(R.string.button_apply, new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -141,6 +153,45 @@ public final class MainActivity extends Activity {
         });
         root.addView(applyBtn, lp(LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT, dp(16)));
+
+        TextView apiTitle = new TextView(this);
+        apiTitle.setText(R.string.api_title);
+        apiTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        apiTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        root.addView(apiTitle, lp(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(20)));
+
+        TextView apiHint = new TextView(this);
+        apiHint.setText(R.string.api_hint);
+        apiHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        root.addView(apiHint, lp(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(2)));
+
+        mApiTokenView = new TextView(this);
+        mApiTokenView.setHint(R.string.api_token);
+        mApiTokenView.setTypeface(Typeface.MONOSPACE);
+        mApiTokenView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        mApiTokenView.setText(prefs().getString(MotionWakeService.PREF_API_TOKEN, ""));
+        mApiTokenView.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyTokenToClipboard();
+            }
+        });
+        root.addView(mApiTokenView, lp(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(4)));
+
+        Button newTokenBtn = button(R.string.button_new_token, new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                String t = MotionWakeService.generateApiToken();
+                prefs().edit().putString(MotionWakeService.PREF_API_TOKEN, t).apply();
+                mApiTokenView.setText(t);
+                toast(R.string.token_updated);
+            }
+        });
+        root.addView(newTokenBtn, lp(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(4)));
 
         mAutoStart = new CheckBox(this);
         mAutoStart.setText(R.string.auto_start);
@@ -172,6 +223,7 @@ public final class MainActivity extends Activity {
         long idle = parseLong(mIdleInput.getText().toString());
         float th = parseFloat(mThresholdInput.getText().toString());
         long check = parseLong(mCheckInput.getText().toString());
+        String url = mUrlInput.getText().toString().trim();
         if (idle <= 0 || idle > 1440) {
             toast(R.string.invalid_idle);
             ok = false;
@@ -185,11 +237,17 @@ public final class MainActivity extends Activity {
             toast(R.string.invalid_check);
             ok = false;
         }
+        if (url.length() > 0
+                && !url.startsWith("http://") && !url.startsWith("https://")) {
+            toast(R.string.invalid_url);
+            ok = false;
+        }
         if (ok) {
             prefs().edit()
                     .putLong(MotionWakeService.PREF_IDLE_MINUTES, idle)
                     .putFloat(MotionWakeService.PREF_THRESHOLD, th)
                     .putLong(MotionWakeService.PREF_CHECK_SECONDS, check)
+                    .putString(MotionWakeService.PREF_BROWSER_URL, url)
                     .apply();
             toast(R.string.applied);
         }
@@ -258,6 +316,19 @@ public final class MainActivity extends Activity {
 
     private void toast(int resId) {
         Toast.makeText(this, resId, Toast.LENGTH_SHORT).show();
+    }
+
+    private void copyTokenToClipboard() {
+        try {
+            android.content.ClipboardManager cm =
+                    (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (cm != null && mApiTokenView != null) {
+                cm.setPrimaryClip(android.content.ClipData.newPlainText(
+                        "motionwake-token", mApiTokenView.getText().toString()));
+                toast(R.string.token_copied);
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     static long parseLong(String s) {

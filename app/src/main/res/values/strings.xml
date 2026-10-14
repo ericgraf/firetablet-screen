@@ -14,6 +14,7 @@
     <string name="idle_minutes">Idle timeout (minutes)</string>
     <string name="threshold">Motion threshold (0.5–15)</string>
     <string name="check_seconds">Motion check interval (seconds, 2–30)</string>
+    <string name="dashboard_url">Dashboard URL (browser / reload target, blank ok)</string>
     <string name="button_start">Start</string>
     <string name="button_stop">Stop</string>
     <string name="button_wake">Wake now</string>
@@ -21,7 +22,14 @@
     <string name="button_apply">Apply</string>
     <string name="auto_start">Start after boot</string>
     <string name="applied">Settings applied</string>
+    <string name="api_title">Home Assistant / REST API (port 8587)</string>
+    <string name="api_hint">http://&lt;tablet-ip&gt;:8587 — /status /start /stop /wake /sleep /settings (X-MotionWake-Token header or ?token=)</string>
+    <string name="api_token">API token — tap to copy</string>
+    <string name="button_new_token">New token</string>
+    <string name="token_updated">Token updated — update Home Assistant too</string>
+    <string name="token_copied">Token copied to clipboard</string>
     <string name="invalid_idle">Idle must be 1–1440 minutes</string>
     <string name="invalid_threshold">Threshold must be 0.5–15</string>
     <string name="invalid_check">Check interval must be 2–30 seconds</string>
+    <string name="invalid_url">URL must start with http:// or https:// (or be left blank)</string>
 </resources>
