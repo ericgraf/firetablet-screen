@@ -40,6 +40,20 @@
 - [ ] Re-run full E2E: idle 10 min → screen dark; motion → wake +
       dashboard reload — on both tablets.
 
+## Long-term reliability verification  ← NEW (user: motion sensor + screen-off seem unreliable)
+- [ ] Passive 3h monitor (running as of <date>): /status poll every 20s per
+      tablet → `/tmp/opencode/mw-watch.log` (screen_state, idle_ms,
+      last_motion_age_ms), plus logcat motion-detection tail with diff
+      values → `/tmp/opencode/mw-motion-A.log` / `mw-motion-B.log`.
+- [ ] Report from monitor: quiet-noise diff distribution vs real detections;
+      every awake→asleep transition (and its trigger: timer vs user);
+      any screen-off that shouldn't happen / sleep that never happens.
+- [ ] Camera-path wake check while asleep: a motion event must turn
+      `screen_on` true within 1–2 check cycles WITHOUT any API /wake.
+- [ ] If A still never sleeps: raise threshold 0.6 → ≥ 1.5× max observed
+      quiet noise (and < ~2.3 real-person minimum), then 30-min retest.
+- [ ] Extend to an overnight run if the 3h window looks healthy.
+
 ## HA login (done for A, do for B if B is a wall)
 - [x] A: logged in as `fire-1`, wall dashboard (Fire-6 view) renders.
       Some cards show red error badges (entities unavailable) — cosmetic,
