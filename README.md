@@ -83,6 +83,65 @@ androidx.core 1.13.1 (only library dependency).
 The notification exposes **Wake / Sleep / Stop** actions, and the app UI shows
 live status plus tunables.
 
+## HTTP API (local REST control — for Home Assistant etc.)
+
+The service runs a tiny local HTTP server on **port 8587** (LAN-reachable).
+Every request is authenticated with the API token: send it as the
+`X-MotionWake-Token` **header** or as a `?token=` **query parameter**. The
+token is generated once on first start — read it in the app UI
+(**MainActivity → API token**) or change it there.
+
+```sh
+TOK=<token>
+BASE=http://<tablet-ip>:8587
+curl -s  -H "X-MotionWake-Token: $TOK" $BASE/status
+# over adb (no LAN needed):
+adb forward tcp:8587 tcp:8587 && curl -s -H "X-MotionWake-Token: $TOK" http://127.0.0.1:8587/status
+```
+
+| Endpoint           | Method | Description                                                        |
+|--------------------|--------|--------------------------------------------------------------------|
+| `/health`          | GET    | liveness probe → `{"ok":true}` (token required)                   |
+| `/status`          | GET    | full state: `running`, `screen_on`, `screen_state`, idle counters, active settings |
+| `/status`          | POST   | toggle monitoring (start ↔ stop)                                   |
+| `/settings`        | GET    | current tunables                                                   |
+| `/settings`        | POST   | update tunables: `{"idle_minutes":n,"threshold":f,"check_seconds":n}` (each optional) |
+| `/start`           | POST   | start the monitor                                                  |
+| `/stop`            | POST   | stop the monitor                                                   |
+| `/shutdown`        | POST   | stop monitor + stop the service process                            |
+| `/wake`            | POST   | wake the screen now (waits up to ~15 s for confirmation)          |
+| `/sleep`           | POST   | put the display to sleep now (waits up to ~160 s; on this Fire build the nap→screensaver→sleep pipeline is slow) |
+| `/browser`         | GET    | current dashboard URL                                              |
+| `/browser`         | POST   | set + open a dashboard URL: `{"url":"http://ha.local:8123/lovelace/wall"}` |
+| `/browser/reload`  | POST   | reload the stored dashboard URL in the kiosk browser              |
+
+Response shape is `{"ok":true, ...}` (HTTP 200); `{"ok":false,"error":...}`
+on 400/401/404/405/413. Example — put the wall tablet to sleep from Home
+Assistant:
+
+```sh
+curl -s -X POST -H "X-MotionWake-Token: $TOK" $BASE/sleep
+# → {"ok":true,"running":true,"screen_on":false,"screen_state":"asleep", ...}
+```
+
+`/status` fields (GET): `app`, `running`, `screen_on` (bool),
+`screen_state` (`awake` | `dreaming` | `asleep`), `idle_ms`,
+`idle_limit_ms`, `last_motion_age_ms`, `idle_minutes`, `threshold`,
+`check_seconds`, `port`, `version`.
+
+## Kiosk dashboard + boot behaviour
+
+- `DashboardBrowser` is a kiosk WebView that renders the dashboard URL
+  (set via the app UI or `POST /browser`) in fullscreen. `scripts/deploy.sh`
+  promotes it to the default **HOME** activity
+  (`cmd package set-home-activity`) and activates the app as a **device
+  administrator**, so Fire keeps it across boots and the launcher screen.
+  It also disables the hijack launcher package if present.
+- On boot the monitor auto-restarts (Boot receiver → BootStarter
+  transparent activity → foreground service, with the `CAMERA` permission
+  and `WRITE_SETTINGS` appop re-asserted by `deploy.sh`), and the dashboard
+  is (re)launched as the home screen.
+
 ## Tunables (app UI, or `motionwatch` SharedPreferences)
 
 | Key             | Default | Meaning                                   |
