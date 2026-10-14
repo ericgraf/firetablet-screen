@@ -42,8 +42,12 @@ public class DashboardBrowser extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().addFlags(
-                android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // NOTE: no FLAG_KEEP_SCREEN_ON on purpose. This build can only be
+        // forced to sleep through PowerManagerService's own screen-off
+        // timeout (the "short timeout" trick in ScreenController), and a
+        // window holding FLAG_KEEP_SCREEN_ON blocks exactly that. The
+        // Service's wake lock and the long system timeout keep the display
+        // on while the dashboard is visible anyway.
 
         mWeb = new WebView(this);
         WebSettings s = mWeb.getSettings();

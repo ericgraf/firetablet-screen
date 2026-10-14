@@ -156,6 +156,10 @@ final class MotionCameraManager {
         post(new Runnable() {
             @Override
             public void run() {
+                // This Fire build's cameraserver rejects camera opens from
+                // UIDs the system considers idle (screen off + no visible
+                // activity) — make sure our override is in place first.
+                CameraUidPolicy.ensureActive(mApp);
                 beginCycle();
             }
         });
@@ -380,6 +384,12 @@ final class MotionCameraManager {
     private void failCycle(String reason) {
         mFailCount++;
         Log.w(TAG, "cycle failed (" + reason + "), retry # " + mFailCount);
+        if (mFailCount >= 3 && (mFailCount == 3 || mFailCount % 10 == 0)) {
+            // Re-apply the camera UidPolicy override (e.g. cameraserver
+            // restarted and lost its in-memory override table). Throttled
+            // inside ensureActive() to once per 5s.
+            CameraUidPolicy.ensureActive(mApp);
+        }
         mPhase = PHASE_IDLE;
         scheduleNext();
     }

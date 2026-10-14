@@ -5,17 +5,22 @@
  * Sleep (tried in order):
  *   1. IPowerManager.goToSleep(long,int,int) via reflection — works when the
  *      DEVICE_POWER permission is granted (privileged/system installs).
- *   2. KEYCODE_SLEEP via InputManager (needs INJECT_EVENTS; verified on this
- *      Fire build to beat the Fully launcher's deprecated FULL_WAKE_LOCK).
- *   3. "Short screen_off_timeout" dance: WRITE_SETTINGS lets us lower the
+ *   2. KEYCODE_SLEEP injected from the service — allowed (without
+ *      INJECT_EVENTS) because our own dashboard window is the focused one;
+ *      the framework's unhandled-KEY_SLEEP path performs the sleep
+ *      (verified on this Fire build with 'input keyevent 223').
+ *   3. KEYCODE_SLEEP via the KeyInjector activity (needs INJECT_EVENTS;
+ *      verified on this Fire build to beat the Fully launcher's deprecated
+ *      FULL_WAKE_LOCK).
+ *   4. "Short screen_off_timeout" dance: WRITE_SETTINGS lets us lower the
  *      system screen-off timeout to a few seconds and let PowerManagerService
  *      perform its own internal timeout sleep (works when nobody holds a
- *      deprecated full wake lock).
- *   4. If the screen still stays on, a deprecated FULL_WAKE_LOCK is holding it
+ *      deprecated full wake lock or a window holds FLAG_KEEP_SCREEN_ON).
+ *   5. If the screen still stays on, a deprecated FULL_WAKE_LOCK is holding it
  *      (on this tablet: the Fully launcher's "always on home"). Identify the
- *      holder from `dumpsys power`, force-stop it, and retry step 3 (needs
+ *      holder from `dumpsys power`, force-stop it, and retry step 4 (needs
  *      the DUMP permission to read the holder).
- *   5. Raw KEY_SLEEP input-event injection (last resort; needs /dev/input).
+ *   6. Raw KEY_SLEEP input-event injection (last resort; needs /dev/input).
  *
  * Wake (tried in order):
  *   1. FULL_WAKE_LOCK with ACQUIRE_CAUSES_WAKEUP (only needs WAKE_LOCK).
@@ -30,6 +35,7 @@ package com.egraf.motionwake;
 
 import android.content.ContentResolver;
 import android.content.Context;
+import android.content.Intent;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
@@ -49,7 +55,10 @@ final class ScreenController {
     private static final String TAG = "ScreenControl";
     private static final String WAKE_LOCK_TAG = "motionwatch:wake";
     private static final long WAKE_LOCK_MILLIS = 5000L;
-    private static final long SLEEP_WAIT_DEADLINE_MS = 20000L;
+    /** Total budget for the timeout sleep: Fire runs the ~60s dim ClockDream
+     *  screensaver before the display truly sleeps, and the nap itself can
+     *  take a little while to kick in, so 150s covers the full pipeline. */
+    private static final long SLEEP_WAIT_DEADLINE_MS = 150000L;
     /** Temp screen_off_timeout used while waiting for the timeout sleep. */
     private static final int SLEEP_TIMEOUT_MS = 5000;
 
@@ -67,10 +76,101 @@ final class ScreenController {
     ScreenController(Context context) {
         mApp = context.getApplicationContext();
         mPower = (PowerManager) mApp.getSystemService(Context.POWER_SERVICE);
+        ensureWakefulnessTracking(mApp);
     }
 
     boolean isScreenOn() {
         return mPower == null || mPower.isInteractive();
+    }
+
+    // -------------------------------------------------- wakefulness state
+
+    /**
+     * Live PowerManager wakefulness (AWAKE / DREAMING / ASLEEP).
+     *
+     * On this Fire build a screen timeout first starts a dim clocksaver
+     * (ClockDream screensaver) which lasts ~60s before the device truly
+     * sleeps; while it runs, isInteractive() is still true. So "is the
+     * screen on?" decisions here use wakefulness instead: DREAMING or
+     * ASLEEP both count as "screen not on", which is exactly what the wall
+     * tablet wants (dim ambient clock is fine, power drops, wake works).
+     */
+    private static volatile int sWakefulness = -1;
+    private static final Object TRACK_LOCK = new Object();
+    private static boolean sTracking = false;
+    // PowerManager.Wakefulness values (stable since API 23; the project's
+    // vendored android.jar predates the names, so keep the raw ints).
+    private static final int WF_ASLEEP = 0;
+    private static final int WF_DREAMING = 1;
+    private static final int WF_AWAKE = 2;
+
+    /** Idempotent; safe to call from any constructor of this service app. */
+    static void ensureWakefulnessTracking(Context app) {
+        synchronized (TRACK_LOCK) {
+            if (sTracking) {
+                return;
+            }
+            sTracking = true;
+            try {
+                // Initial guess from the current state; the broadcasts below
+                // then keep it live.
+                PowerManager pm0 = (PowerManager) app
+                        .getSystemService(Context.POWER_SERVICE);
+                sWakefulness = (pm0 != null && pm0.isInteractive())
+                        ? WF_AWAKE : WF_ASLEEP;
+                // This Fire build lacks PowerManager.addWakefulnessChangeCallback
+                // (absent from its framework.jar), but it does broadcast the
+                // dream lifecycle — which is exactly the "screensaver before
+                // sleep" phase we need to see — plus the classic screen
+                // power broadcasts. That's enough to derive AWAKE/DREAMING/
+                // ASLEEP.
+                android.content.IntentFilter f = new android.content.IntentFilter();
+                f.addAction(Intent.ACTION_SCREEN_ON);
+                f.addAction(Intent.ACTION_SCREEN_OFF);
+                f.addAction("android.intent.action.DREAMING_STARTED");
+                f.addAction("android.intent.action.DREAMING_STOPPED");
+                app.registerReceiver(new android.content.BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context c, Intent i) {
+                        String a = i == null ? null : i.getAction();
+                        if (a == null) {
+                            return;
+                        }
+                        if ("android.intent.action.DREAMING_STARTED".equals(a)) {
+                            sWakefulness = WF_DREAMING;
+                        } else if ("android.intent.action.DREAMING_STOPPED".equals(a)) {
+                            PowerManager pm = (PowerManager) c
+                                    .getSystemService(Context.POWER_SERVICE);
+                            sWakefulness = (pm != null && pm.isInteractive())
+                                    ? WF_AWAKE : WF_ASLEEP;
+                        } else if (Intent.ACTION_SCREEN_ON.equals(a)) {
+                            sWakefulness = WF_AWAKE;
+                        } else if (Intent.ACTION_SCREEN_OFF.equals(a)) {
+                            sWakefulness = WF_ASLEEP;
+                        }
+                    }
+                }, f);
+            } catch (Throwable t) {
+                Log.d(TAG, "screen state receivers unavailable", t);
+            }
+        }
+    }
+
+    static boolean isAwake() {
+        return sWakefulness == WF_AWAKE;
+    }
+
+    static String screenStateName() {
+        switch (sWakefulness) {
+            case WF_AWAKE:
+                return "awake";
+            case WF_DREAMING:
+                return "dreaming";
+            case WF_ASLEEP:
+                return "asleep";
+            default:
+                return "unknown";
+        }
     }
 
     private int mInjectSeq = 0;
@@ -101,8 +201,8 @@ final class ScreenController {
             } catch (Throwable ignored) {
             }
             mApp.startActivity(i, opts.toBundle());
-            // The activity retries injection until its window is top (<=3s).
-            long deadline = SystemClock.uptimeMillis() + 5000L;
+            // The injector stays alive until the screen state flips (<=~4s).
+            long deadline = SystemClock.uptimeMillis() + 8000L;
             while (SystemClock.uptimeMillis() < deadline) {
                 if (KeyInjector.isDone(seq)) {
                     boolean ok = KeyInjector.resultOk(seq);
@@ -139,27 +239,35 @@ final class ScreenController {
     }
 
     private void runWake() {
-        boolean on = isScreenOn();
+        boolean on = isAwake();
         if (!on) {
             acquireWakeLock();
             SystemClock.sleep(150L);
-            on = isScreenOn();
+            on = isAwake();
         }
         if (!on) {
             binderWake();
             SystemClock.sleep(300L);
-            on = isScreenOn();
+            on = isAwake();
+        }
+        if (!on) {
+            // Direct injection with the dashboard (our uid) as the focused
+            // window targets the dashboard, which lets the framework's
+            // unhandled-KEY_WAKEUP path do the wake.
+            injectKeyFromService(KeyEvent.KEYCODE_WAKEUP);
+            SystemClock.sleep(500L);
+            on = isAwake();
         }
         if (!on) {
             if (injectKeycode(KeyEvent.KEYCODE_WAKEUP)) {
                 SystemClock.sleep(500L);
             }
-            on = isScreenOn();
+            on = isAwake();
         }
         if (!on) {
             injectKey(SCAN_CODE_WAKEUP);
         }
-        Log.i(TAG, "screen wake requested (on=" + on + ")");
+        Log.i(TAG, "screen wake requested (awake=" + on + ")");
     }
 
     void sleep() {
@@ -182,37 +290,50 @@ final class ScreenController {
     }
 
     private void runSleep() {
-        boolean ok = !isScreenOn();
+        boolean ok = !isAwake();
         if (!ok) {
+            // 1) framework API (instant; needs DEVICE_POWER, which this build
+            //    does not grant to us — keep first anyway, it's a no-op then).
             ok = tryGoToSleep();
         }
         if (!ok) {
-            // Verified on this Fire build: the forced-sleep key path also
-            // beats the launcher's deprecated FULL_WAKE_LOCK (Fully).
-            if (injectKeycode(KeyEvent.KEYCODE_SLEEP)) {
-                SystemClock.sleep(800L);
-                ok = !isScreenOn();
-            }
-        }
-        if (!ok) {
-            ok = timeoutTrickOnce();
-        }
-        if (!ok) {
-            // A deprecated FULL_WAKE_LOCK legitimately keeps the screen on
-            // (typical offender on this tablet: the Fully launcher, which uses
-            // it for its "always on" home). Kill the holder and retry the trick.
+            // 2) Our own wake lock (FULL_WAKE_LOCK) holds the screen on for
+            //    ~5s after a wake — drop it before the timeout sleep below.
+            releaseOwnWakeLock();
+            // 3) A deprecated FULL_WAKE_LOCK held by some other app would
+            //    block the timeout sleep (typical offender: a kiosk
+            //    launcher's "always on home") — clear it before the long
+            //    timeout wait below.
             String victim = findFullWakeLockHolder();
             if (victim != null) {
                 Log.i(TAG, "sleep: force-stopping FULL_WAKE_LOCK holder " + victim);
                 forceStopPackage(victim);
                 SystemClock.sleep(1000L); // let the holder release its locks
-                ok = timeoutTrickOnce();
+            }
+            // 4) WORKHORSE on this build: PowerManagerService's own screen-off
+            //    timeout (WRITE_SETTINGS). A short timeout lets PMS perform
+            //    the sleep internally — no injector uid involved, so it beats
+            //    the DEVICE_POWER/INJECT_EVENTS gates (this is how we beat
+            //    the Fully launcher's "always on home" back in the day).
+            //    Note: on this Fire build the nap first shows the ~60s dim
+            //    ClockDream screensaver; DREAMING already counts as success.
+            ok = timeoutTrickOnce();
+        }
+        if (!ok) {
+            // 5) KEYCODE_SLEEP key paths (work when our uid is privileged).
+            injectKeyFromService(KeyEvent.KEYCODE_SLEEP);
+            SystemClock.sleep(800L);
+            ok = !isAwake();
+            if (!ok && injectKeycode(KeyEvent.KEYCODE_SLEEP)) {
+                SystemClock.sleep(800L);
+                ok = !isAwake();
             }
         }
         if (!ok) {
             injectKey(SCAN_CODE_SLEEP);
         }
-        Log.i(TAG, "screen sleep requested (ok=" + ok + ")");
+        Log.i(TAG, "screen sleep requested (ok=" + ok + ", state="
+                + screenStateName() + ")");
     }
 
     /** Briefly lower the system screen-off timeout, wait for the framework's
@@ -240,7 +361,7 @@ final class ScreenController {
         if (canTrick) {
             long deadline = SystemClock.uptimeMillis() + SLEEP_WAIT_DEADLINE_MS;
             while (SystemClock.uptimeMillis() < deadline) {
-                if (!isScreenOn()) {
+                if (!isAwake()) {
                     slept = true;
                     break;
                 }
@@ -338,12 +459,30 @@ final class ScreenController {
         if (lock == null) {
             return false;
         }
+        sLastWakeLock = lock;
         try {
             lock.acquire(WAKE_LOCK_MILLIS);
             return true;
         } catch (Exception e) {
             Log.w(TAG, "wake lock acquire failed", e);
             return false;
+        }
+    }
+
+    /** Last FULL_WAKE_LOCK we took for a wake — a deprecated full lock keeps the
+     *  screen on until released, so drop it before trying to sleep. */
+    private static PowerManager.WakeLock sLastWakeLock;
+
+    private void releaseOwnWakeLock() {
+        PowerManager.WakeLock lock = sLastWakeLock;
+        if (lock != null) {
+            try {
+                if (lock.isHeld()) {
+                    lock.release();
+                }
+            } catch (Throwable ignored) {
+            }
+            sLastWakeLock = null;
         }
     }
 
@@ -417,6 +556,68 @@ final class ScreenController {
     }
 
     // ------------------------------------------------------------- input key
+
+    /**
+     * Inject a key pair directly from the service context.
+     *
+     * This build allows injection WITHOUT INJECT_EVENTS as long as the
+     * focused window belongs to our own uid (see the "Injecting to another
+     * application requires INJECT_EVENTS" check in
+     * InputManagerService.injectInputEvent). With the DashboardBrowser on
+     * top we satisfy that exactly — and the event then targets the DASHBOARD
+     * window, which does not consume the key; the framework processes the
+     * unhandled KEYCODE_SLEEP/KEYCODE_WAKEUP and flips the screen (verified
+     * on this build with 'input keyevent 223' / 'input keyevent 224').
+     *
+     * Returns true if the framework accepted both events.
+     */
+    private boolean injectKeyFromService(int keycode) {
+        try {
+            android.hardware.input.InputManager im =
+                    (android.hardware.input.InputManager)
+                            mApp.getSystemService(Context.INPUT_SERVICE);
+            java.lang.reflect.Method m =
+                    android.hardware.input.InputManager.class.getMethod(
+                            "injectInputEvent", android.view.InputEvent.class, int.class);
+            long t1 = SystemClock.uptimeMillis();
+            Object dR = m.invoke(im, new android.view.KeyEvent(
+                    t1, t1, android.view.KeyEvent.ACTION_DOWN, keycode, 0, 0, 0, 0),
+                    1 /* INJECT_INPUT_EVENT_MODE_WAIT_FOR_RESULT */);
+            Thread.sleep(100L);
+            long t2 = SystemClock.uptimeMillis();
+            Object uR = m.invoke(im, new android.view.KeyEvent(
+                    t2, t2, android.view.KeyEvent.ACTION_UP, keycode, 0, 0, 0, 0),
+                    1);
+            boolean ok = accepted(dR) && accepted(uR);
+            Log.i(TAG, "service injection keycode " + keycode + " ok=" + ok
+                    + " down=" + describe(dR) + " up=" + describe(uR));
+            return ok;
+        } catch (Throwable t) {
+            Log.d(TAG, "service injection of keycode " + keycode + " unavailable", t);
+            return false;
+        }
+    }
+
+    /** interpret injectInputEvent results across API eras (Boolean or int). */
+    private static boolean accepted(Object r) {
+        if (r instanceof Boolean) {
+            return (Boolean) r;
+        }
+        if (r instanceof Number) {
+            return ((Number) r).intValue() == 0;
+        }
+        return false;
+    }
+
+    private static int describe(Object r) {
+        if (r instanceof Boolean) {
+            return (Boolean) r ? 0 : 1;
+        }
+        if (r instanceof Number) {
+            return ((Number) r).intValue();
+        }
+        return -999;
+    }
 
     private void injectKey(int scanCode) {
         for (int node = 0; node <= 7; node++) {

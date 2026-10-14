@@ -98,6 +98,7 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     public void onCreate() {
         super.onCreate();
         mPower = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        ScreenController.ensureWakefulnessTracking(this);
         mPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         SharedPreferences.Editor editor = mPrefs.edit();
         if (!mPrefs.contains(PREF_API_TOKEN)) {
@@ -286,7 +287,7 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     private void tickOnce() {
         long idle = idleNowMs();
         sIdleMs = idle;
-        if (idle >= mIdleMs && isInteractive()) {
+        if (idle >= mIdleMs && ScreenController.isAwake()) {
             Log.i(TAG, "idle for " + (idle / 1000) + "s — putting screen to sleep");
             new ScreenController(this).sleep();
         }
@@ -307,7 +308,7 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     @Override
     public void onMotionDetected() {
         touchMotion();
-        if (!isInteractive()) {
+        if (!ScreenController.isAwake()) {
             Log.i(TAG, "motion while screen off — waking display");
             java.util.concurrent.Future<?> f =
                     new ScreenController(this).wakeFuture();
@@ -333,6 +334,7 @@ public final class MotionWakeService extends Service implements MotionCameraMana
                 + "\"app\":\"motionwake\","
                 + "\"running\":" + sRunning + ","
                 + "\"screen_on\":" + isInteractive() + ","
+                + "\"screen_state\":\"" + ScreenController.screenStateName() + "\","
                 + "\"idle_ms\":" + sIdleMs + ","
                 + "\"idle_limit_ms\":" + mIdleMs + ","
                 + "\"last_motion_age_ms\":" + lastAge + ","
@@ -418,10 +420,10 @@ public final class MotionWakeService extends Service implements MotionCameraMana
 
     public String apiWake() {
         touchMotion();
-        boolean wasOn = isInteractive();
+        boolean wasOn = ScreenController.isAwake();
         java.util.concurrent.Future<?> f = new ScreenController(this).wakeFuture();
         try {
-            f.get(8000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            f.get(15000L, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (Exception ignored) {
         }
         if (!wasOn) {
@@ -431,10 +433,11 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     }
 
     public String apiSleep() {
-        // The WRITE_SETTINGS timeout path can take up to ~20 s; bound the wait.
+        // The WRITE_SETTINGS timeout path runs through the Fire nap + ~60s
+        // screensaver pipeline; bound the wait a little beyond its 150s budget.
         java.util.concurrent.Future<?> f = new ScreenController(this).sleepFuture();
         try {
-            f.get(25000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            f.get(160000L, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (Exception ignored) {
         }
         return statusJson();

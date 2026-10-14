@@ -1,12 +1,19 @@
 /*
  * KeyInjector — a tiny, transparent, focusable activity whose only job is to
  * inject one key event (KEYCODE_SLEEP / KEYCODE_WAKEUP) through InputManager
- * and finish.
+ * and stay alive until the screen state actually flips.
  *
  * Why: InputManagerService allows an app to inject input events WITHOUT the
  * signature INJECT_EVENTS permission when *our window is the foreground one*.
  * The service context is not "foreground", so it hops through this activity:
- * resume -> onWindowFocusChanged(true) -> inject -> record result -> finish.
+ * resume -> onWindowFocusChanged(true) -> inject -> poll screen state -> finish.
+ *
+ * The screen flip happens in the framework ASYNCHRONOUSLY after the event is
+ * accepted into the dispatcher — if this activity finishes right after
+ * injectInputEvent returns, the window dies before the framework processes the
+ * key and the event is dropped (observed on this Fire build). So: inject, then
+ * poll PowerManager.isInteractive() (keeping the window alive) until the
+ * target state is reached or the budget runs out.
  *
  * The service calls startInjector(seq, keycode) and polls {@link #isDone} /
  * {@link #resultOk} on its background thread.
@@ -14,15 +21,24 @@
 package com.egraf.motionwake;
 
 import android.app.Activity;
+import android.content.Context;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.os.SystemClock;
+import android.util.Log;
 import android.view.InputEvent;
 import android.view.KeyEvent;
+import android.view.View;
 import android.view.WindowManager;
 
-import java.lang.reflect.Method;
-
 public class KeyInjector extends Activity {
+
+    private static final String TAG = "KeyInjector";
+
+    /** Poll cadence while waiting for the screen state to flip. */
+    private static final long STEP_MS = 300L;
+    /** Total budget for the state to flip after we come up. */
+    private static final int MAX_PASSES = 12; // ~3.6s
 
     private static final Object LOCK = new Object();
     private static volatile int sSeq = -1;
@@ -30,7 +46,6 @@ public class KeyInjector extends Activity {
 
     private int mSeq = -1;
     private int mKeyCode = -1;
-    private boolean mDone = false;
 
     public static void record(int seq, boolean ok) {
         synchronized (LOCK) {
@@ -72,7 +87,7 @@ public class KeyInjector extends Activity {
         //   * ScreenController therefore starts this task via
         //     ActivityOptions.setLaunchTaskBehind(true): our window becomes
         //     the first keyable window in the walk (above the wallpaper,
-        //     below Fully's), and the walk resolves to NULL focus while we
+        //     below the home), and the walk resolves to NULL focus while we
         //     are alive -> injection is allowed.
         WindowManager.LayoutParams lp = getWindow().getAttributes();
         lp.dimAmount = 0f;
@@ -82,62 +97,94 @@ public class KeyInjector extends Activity {
             finish();
             return;
         }
-        // If focus never comes (shouldn't happen), inject after a grace period.
-        getWindow().getDecorView().postDelayed(this::doInject, 400L);
+        // Give the window a moment to attach, then start polling.
+        getWindow().getDecorView().postDelayed(this::step, 300L);
     }
 
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) {
-            doInject();
-        }
+        // Nothing to do: step() runs regardless (window attached + focus).
     }
 
-    private void doInject() {
-        if (mDone || mKeyCode < 0) {
+    private int mPass = 0;
+
+    private void step() {
+        if (mKeyCode < 0) {
+            record(mSeq, false);
+            finish();
             return;
         }
-        mDone = true;
-        // The injection is only accepted once OUR window is the top one; when
-        // this activity is background-started that happens slightly after
-        // focus is first granted — so retry until it sticks (or we time out).
-        long deadline = SystemClock.uptimeMillis() + 3000L;
-        boolean ok = false;
-        int lastDown = -999, lastUp = -999;
-        String err = "";
-        while (SystemClock.uptimeMillis() < deadline) {
-            try {
-                android.hardware.input.InputManager im =
-                        (android.hardware.input.InputManager) getSystemService(INPUT_SERVICE);
-                // injectInputEvent is @hide in the SDK stubs — reflect it.
-                Method m = android.hardware.input.InputManager.class.getMethod(
-                        "injectInputEvent", InputEvent.class, int.class);
-                long t1 = SystemClock.uptimeMillis();
-                lastDown = ((Number) m.invoke(im,
-                        new KeyEvent(t1, t1, KeyEvent.ACTION_DOWN, mKeyCode, 0, 0, 0, 0),
-                        1 /* INJECT_INPUT_EVENT_MODE_WAIT_FOR_RESULT */)).intValue();
-                Thread.sleep(80L);
-                long t2 = SystemClock.uptimeMillis();
-                lastUp = ((Number) m.invoke(im,
-                        new KeyEvent(t2, t2, KeyEvent.ACTION_UP, mKeyCode, 0, 0, 0, 0),
-                        1 /* INJECT_INPUT_EVENT_MODE_WAIT_FOR_RESULT */)).intValue();
-                // 0 = SUCCESS, 1 = PERMISSION_DENIED (not top app yet),
-                // 3 = TIMEOUT, other negative = FAILED.
-                ok = lastDown == 0 /* INJECT_INPUT_EVENT_RESULT_SUCCESS */
-                        && lastUp == 0;
-                if (ok) {
-                    break;
-                }
-            } catch (Exception e) {
-                err = e.getClass().getSimpleName() + ": " + e.getMessage();
-            }
-            SystemClock.sleep(200L);
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        boolean screenOn = pm != null && pm.isInteractive();
+        boolean wantSleep = (mKeyCode == KeyEvent.KEYCODE_SLEEP);
+        boolean target = wantSleep ? !screenOn : screenOn;
+        if (target) {
+            Log.i(TAG, "code=" + mKeyCode + " already at target, pass=" + mPass);
+            record(mSeq, true);
+            finish();
+            return;
         }
-        android.util.Log.i("KeyInjector", "injected code=" + mKeyCode
-                + " down=" + lastDown + " up=" + lastUp
-                + (err.isEmpty() ? "" : " err=" + err) + " ok=" + ok);
-        record(mSeq, ok);
-        finish();
+        // Inject the key pair (the dispatcher may still be settling on the
+        // early passes — re-injecting an already-flipped, in-target key is a
+        // harmless no-op, so retrying is safe).
+        int down = -999, up = -999;
+        String err = "";
+        try {
+            android.hardware.input.InputManager im =
+                    (android.hardware.input.InputManager)
+                            getSystemService(Context.INPUT_SERVICE);
+            java.lang.reflect.Method m =
+                    android.hardware.input.InputManager.class.getMethod(
+                            "injectInputEvent", InputEvent.class, int.class);
+            long t1 = SystemClock.uptimeMillis();
+            Object dR = m.invoke(im,
+                    new KeyEvent(t1, t1, KeyEvent.ACTION_DOWN, mKeyCode, 0, 0, 0, 0),
+                    1 /* INJECT_INPUT_EVENT_MODE_WAIT_FOR_RESULT */);
+            Thread.sleep(60L); // let the DOWN settle before UP
+            long t2 = SystemClock.uptimeMillis();
+            Object uR = m.invoke(im,
+                    new KeyEvent(t2, t2, KeyEvent.ACTION_UP, mKeyCode, 0, 0, 0, 0),
+                    1 /* INJECT_INPUT_EVENT_MODE_WAIT_FOR_RESULT */);
+            down = describe(dR);
+            up = describe(uR);
+        } catch (Exception e) {
+            err = e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
+        // Give the framework a beat, then check the real target: screen state.
+        try {
+            Thread.sleep(120L);
+        } catch (InterruptedException ignored) {
+        }
+        mPass++;
+        screenOn = pm != null && pm.isInteractive();
+        if ((wantSleep && !screenOn) || (!wantSleep && screenOn)) {
+            Log.i(TAG, "code=" + mKeyCode + " injected down=" + down
+                    + " up=" + up + (err.isEmpty() ? "" : " err=" + err)
+                    + " ok=true pass=" + mPass);
+            record(mSeq, true);
+            finish();
+            return;
+        }
+        if (mPass >= MAX_PASSES) {
+            Log.i(TAG, "code=" + mKeyCode + " injected down=" + down
+                    + " up=" + up + (err.isEmpty() ? "" : " err=" + err)
+                    + " ok=false pass=" + mPass);
+            record(mSeq, false);
+            finish();
+            return;
+        }
+        getWindow().getDecorView().postDelayed(this::step, STEP_MS);
+    }
+
+    /** 0 = accepted, 1 = rejected, -999 = unexpected shape (log aid). */
+    private static int describe(Object result) {
+        if (result instanceof Boolean) {
+            return (Boolean) result ? 0 : 1;
+        }
+        if (result instanceof Number) {
+            return ((Number) result).intValue();
+        }
+        return -999;
     }
 }
