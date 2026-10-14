@@ -309,7 +309,13 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         touchMotion();
         if (!isInteractive()) {
             Log.i(TAG, "motion while screen off — waking display");
-            new ScreenController(this).wake();
+            java.util.concurrent.Future<?> f =
+                    new ScreenController(this).wakeFuture();
+            try {
+                f.get(8000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (Exception ignored) {
+            }
+            openDashboard(true);
         }
     }
 
@@ -412,10 +418,14 @@ public final class MotionWakeService extends Service implements MotionCameraMana
 
     public String apiWake() {
         touchMotion();
+        boolean wasOn = isInteractive();
         java.util.concurrent.Future<?> f = new ScreenController(this).wakeFuture();
         try {
             f.get(8000L, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (Exception ignored) {
+        }
+        if (!wasOn) {
+            openDashboard(true);
         }
         return statusJson();
     }
@@ -530,15 +540,47 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         }
     }
 
+    /**
+     * Open the dashboard in our built-in DashboardBrowser (singleTask
+     * instance is reused: relaunch re-loads the page, so wake always shows
+     * a fresh dashboard). Returns true if launch was issued.
+     */
+    public boolean openDashboard(boolean reload) {
+        String url = mPrefs.getString(PREF_BROWSER_URL, "");
+        if (url == null || url.length() == 0) {
+            Log.i(TAG, "openDashboard: no dashboard URL stored — skipped");
+            return false;
+        }
+        try {
+            Intent intent = new Intent(this, DashboardBrowser.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            intent.putExtra(DashboardBrowser.EXTRA_URL, url);
+            intent.putExtra(DashboardBrowser.EXTRA_RELOAD, reload);
+            startActivity(intent);
+            Log.i(TAG, "dashboard open " + url + " reload=" + reload);
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "dashboard startActivity failed", e);
+        }
+        // Fallback: shell am (last resort on this Fire build).
+        return execSimple(new String[]{"am", "start", "--user", "0",
+                "-n", getPackageName() + "/.DashboardBrowser",
+                "--es", "com.egraf.motionwake.extra.URL", url,
+                "--ez", "com.egraf.motionwake.extra.RELOAD",
+                reload ? "true" : "false"}) == 0;
+    }
+
     private boolean openInBrowser(String url) {
         if (url == null || url.length() == 0) {
             return false;
         }
         try {
-            Intent intent = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url));
+            Intent intent = new Intent(this, DashboardBrowser.class);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            intent.putExtra(DashboardBrowser.EXTRA_URL, url);
+            intent.putExtra(DashboardBrowser.EXTRA_RELOAD, true);
             startActivity(intent);
-            Log.i(TAG, "browser open " + url + " -> startActivity issued");
+            Log.i(TAG, "browser open (built-in) " + url);
             return true;
         } catch (Exception e) {
             Log.w(TAG, "browser startActivity failed", e);

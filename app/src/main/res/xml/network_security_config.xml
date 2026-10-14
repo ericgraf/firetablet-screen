@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The wall dashboard (Home Assistant) is served over plain http on the
+     LAN. Allow cleartext traffic for our WebView (kiosk context). -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
