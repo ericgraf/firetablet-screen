@@ -52,6 +52,13 @@ adb -s "$SERIAL" shell pm grant "$PKG" android.permission.INJECT_EVENTS 2>/dev/n
 # Fire OS custom permission: direct BAL exemption for the injector activity.
 adb -s "$SERIAL" shell pm grant "$PKG" android.permission.START_ACTIVITIES_FROM_BACKGROUND 2>/dev/null || true
 
+echo "==> Setting persistence (device admin + default home)"
+# Device admin: makes the package uninstall-proof (removal: dpm remove-active-admin /
+# the app's own dpm.removeActiveAdmin).
+adb -s "$SERIAL" shell dpm set-active-admin --user 0 "$PKG/.MwDeviceAdmin" 2>/dev/null || true
+# Default home: device lands on the dashboard browser after boot.
+adb -s "$SERIAL" shell cmd package set-home-activity --user 0 "$PKG/.DashboardBrowser" 2>/dev/null || true
+
 echo
 echo "Installed. Useful commands ($(echo -n "am broadcast -a <ACTION> -n $PKG/.ControlReceiver" | head -c 60)...):"
 echo
