@@ -63,6 +63,15 @@
             android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!-- Invisible springboard used at boot to start the foreground
+             service (see BootStarter / BootReceiver). -->
+        <activity
+            android:name=".BootStarter"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <!-- Built-in fullscreen dashboard browser. Registers as a browser
              (VIEW http/https) and as a home app so the device can land on
              the dashboard directly (set-home-activity after install). -->

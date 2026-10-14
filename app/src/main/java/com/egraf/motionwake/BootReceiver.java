@@ -26,8 +26,14 @@ public final class BootReceiver extends BroadcastReceiver {
         SharedPreferences prefs = context.getSharedPreferences(
                 MotionWakeService.PREFS_NAME, Context.MODE_PRIVATE);
         if (prefs.getBoolean(MotionWakeService.PREF_AUTO_START, true)) {
-            Log.i(TAG, "auto-start enabled — starting monitor");
-            ControlReceiver.startService(context.getApplicationContext());
+            Log.i(TAG, "auto-start enabled — starting BootStarter");
+            // Via a (translucent) activity: the FGS start from the
+            // BOOT_COMPLETED broadcast context itself is rejected by this
+            // build ("Background execution not allowed"), but an activity
+            // may start the foreground service.
+            Intent starter = new Intent(context, BootStarter.class);
+            starter.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            context.startActivity(starter);
         } else {
             Log.i(TAG, "auto-start disabled — skipping");
         }
