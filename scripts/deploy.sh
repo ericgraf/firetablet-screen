@@ -58,6 +58,10 @@ echo "==> Setting persistence (device admin + default home)"
 adb -s "$SERIAL" shell dpm set-active-admin --user 0 "$PKG/.MwDeviceAdmin" 2>/dev/null || true
 # Default home: device lands on the dashboard browser after boot.
 adb -s "$SERIAL" shell cmd package set-home-activity --user 0 "$PKG/.DashboardBrowser" 2>/dev/null || true
+# Nova-launcher wrapper (last-used app relaunched by Amazon's Eve at boot):
+# disable it so it can't cover the dashboard home. Re-enable with:
+#   adb shell pm enable com.baronkiko.launcherhijacl
+adb -s "$SERIAL" shell pm disable-user --user 0 com.baronkiko.launcherhijacl 2>/dev/null || true
 
 echo
 echo "Installed. Useful commands ($(echo -n "am broadcast -a <ACTION> -n $PKG/.ControlReceiver" | head -c 60)...):"
