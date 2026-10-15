@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">MotionWake</string>
+    <string name="a11y_desc">MotionWake uses this (background-only) accessibility service to dismiss the screen lock after we wake it, so the dashboard is visible. It sees no content and performs no navigation on its own.</string>
     <string name="notif_body">Watching camera — screen sleeps after idle.</string>
     <string name="notif_body_big">Watching the camera. The screen sleeps after the idle timeout and wakes on motion.</string>
     <string name="action_wake">Wake</string>

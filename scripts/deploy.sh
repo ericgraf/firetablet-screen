@@ -49,6 +49,11 @@ adb -s "$SERIAL" shell pm grant "$PKG" android.permission.SYSTEM_ALERT_WINDOW 2>
 adb -s "$SERIAL" shell appops set "$PKG" SYSTEM_ALERT_WINDOW allow 2>/dev/null || true
 # INJECT_EVENTS (signature) — direct InputManager key injection fallback.
 adb -s "$SERIAL" shell pm grant "$PKG" android.permission.INJECT_EVENTS 2>/dev/null || true
+# AMAZON_CONTROL_KEYGUARD (signature|amazon) — lets AmazonKeyguardService
+# accept our uid for the dismiss transaction (see MwA11y / ScreenController
+# chain). 'amazon' protection level is declared-grantable on this build.
+adb -s "$SERIAL" shell pm grant "$PKG" com.amazon.permission.AMAZON_CONTROL_KEYGUARD 2>/dev/null || true
+adb -s "$SERIAL" shell pm grant "$PKG" android.permission.CONTROL_KEYGUARD 2>/dev/null || true
 # Fire OS custom permission: direct BAL exemption for the injector activity.
 adb -s "$SERIAL" shell pm grant "$PKG" android.permission.START_ACTIVITIES_FROM_BACKGROUND 2>/dev/null || true
 
@@ -62,6 +67,25 @@ adb -s "$SERIAL" shell cmd package set-home-activity --user 0 "$PKG/.DashboardBr
 # disable it so it can't cover the dashboard home. Re-enable with:
 #   adb shell pm enable com.baronkiko.launcherhijacl
 adb -s "$SERIAL" shell pm disable-user --user 0 com.baronkiko.launcherhijacl 2>/dev/null || true
+
+echo "==> Enabling the dismiss accessibility service"
+# MotionWake's a11y service (MwA11y) is the primary keyguard-dismiss channel:
+# the a11y framework dispatches its BACK/swipe with a trusted uid, bypassing
+# the INJECT_EVENTS check that blocks our app uid. The setting is a
+# colon-separated component list — append idempotently.
+A11Y_SVC="$PKG/.MwA11y"
+CUR_A11Y="$(adb -s "$SERIAL" shell settings get secure enabled_accessibility_services 2>/dev/null | tr -d '\r' || true)"
+[ "$CUR_A11Y" = "null" ] && CUR_A11Y=""
+case ":$CUR_A11Y:" in
+  *":$A11Y_SVC:"*)
+    echo "    a11y service already enabled" ;;
+  *)
+    if [ -n "$CUR_A11Y" ]; then NEW_A11Y="$CUR_A11Y:$A11Y_SVC"; else NEW_A11Y="$A11Y_SVC"; fi
+    adb -s "$SERIAL" shell settings put secure enabled_accessibility_services "$NEW_A11Y" || true
+    ;;
+esac
+A11Y_NOW="$(adb -s "$SERIAL" shell settings get secure enabled_accessibility_services 2>/dev/null | tr -d '\r' || true)"
+echo "    enabled_accessibility_services: ${A11Y_NOW:-<empty>}"
 
 echo "==> Dismissing the system keyguard (one-time)"
 # While the keyguard is up its window pins the display's screen-off timeout
@@ -84,4 +108,4 @@ echo "  stop monitor  : adb -s $SERIAL shell am broadcast -a com.egraf.motionwak
 echo "  wake screen   : adb -s $SERIAL shell am broadcast -a com.egraf.motionwake.action.WAKE -n $PKG/.ControlReceiver"
 echo "  sleep screen  : adb -s $SERIAL shell am broadcast -a com.egraf.motionwake.action.SLEEP -n $PKG/.ControlReceiver"
 echo "  open app      : adb -s $SERIAL shell am start -n $PKG/.MainActivity"
-echo "  logs          : adb -s $SERIAL logcat | grep -E 'MotionWake|MotionCamera|ScreenControl|ControlReceiver'"
+echo "  logs          : adb -s $SERIAL logcat | grep -E 'MotionWake|MotionCamera|ScreenControl|KeyguardSwipe|ControlReceiver'"

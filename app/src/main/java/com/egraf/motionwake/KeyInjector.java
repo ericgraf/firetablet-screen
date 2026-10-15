@@ -46,6 +46,7 @@ public class KeyInjector extends Activity {
 
     private int mSeq = -1;
     private int mKeyCode = -1;
+    private boolean mInjectAlways = false;
 
     public static void record(int seq, boolean ok) {
         synchronized (LOCK) {
@@ -71,6 +72,7 @@ public class KeyInjector extends Activity {
         super.onCreate(savedInstanceState);
         mSeq = getIntent().getIntExtra("seq", -1);
         mKeyCode = getIntent().getIntExtra("keycode", -1);
+        mInjectAlways = getIntent().getBooleanExtra("inject_always", false);
         // Keep the window plain, visible and *touchable*. FLAG_NOT_TOUCHABLE
         // windows are skipped by the focus walk, and this window must stay in
         // it (see below). It is transparent and finishes within seconds, so
@@ -119,7 +121,9 @@ public class KeyInjector extends Activity {
         boolean screenOn = pm != null && pm.isInteractive();
         boolean wantSleep = (mKeyCode == KeyEvent.KEYCODE_SLEEP);
         boolean target = wantSleep ? !screenOn : screenOn;
-        if (target) {
+        // inject_always: the goal is NOT a screen-state flip (e.g. KEY_BACK
+        // dismissing the keyguard) — always perform the injection.
+        if (target && !mInjectAlways) {
             Log.i(TAG, "code=" + mKeyCode + " already at target, pass=" + mPass);
             record(mSeq, true);
             finish();

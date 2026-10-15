@@ -173,7 +173,23 @@ public final class MotionWakeService extends Service implements MotionCameraMana
 
         if (ACTION_WAKE.equals(action)) {
             touchMotion();
-            new ScreenController(this).wake();
+            // Wake, then dismiss the keyguard with the real-swipe fix — on a
+            // background thread: the combined budget doesn't fit the
+            // main thread's ANR allowance.
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    java.util.concurrent.Future<?> f =
+                            new ScreenController(MotionWakeService.this).wakeFuture();
+                    try {
+                        f.get(15000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    } catch (Exception ignored) {
+                        // fall through: the swipe gate is a no-op if the
+                        // keyguard isn't up anyway
+                    }
+                    new ScreenController(MotionWakeService.this).dismissKeyguardSwipe();
+                }
+            }, "motionwatch-wake").start();
             return START_STICKY;
         }
         if (ACTION_SLEEP.equals(action)) {
@@ -574,9 +590,14 @@ public final class MotionWakeService extends Service implements MotionCameraMana
      * a fresh dashboard). Returns true if launch was issued.
      */
     public boolean openDashboard(boolean reload) {
-        // Wake path: if the system keyguard came up after the last sleep,
-        // dismiss it (it also pins the screen-off timeout to 10 s while up).
-        dismissKeyguard();
+        // Wake path: dismiss the system keyguard with a genuine swipe if it
+        // came up after the last sleep (on this build only a user swipe
+        // sticks — while up it also pins the screen-off timeout to 10 s).
+        // Fall back to the legacy requestDismissKeyguard attempt.
+        boolean dismissed = new ScreenController(this).dismissKeyguardSwipe();
+        if (!dismissed) {
+            dismissKeyguard();
+        }
         String url = mPrefs.getString(PREF_BROWSER_URL, "");
         if (url == null || url.length() == 0) {
             Log.i(TAG, "openDashboard: no dashboard URL stored — skipped");

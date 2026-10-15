@@ -35,6 +35,18 @@ public final class BootStarter extends Activity {
             Log.w(TAG, "service start failed", e);
         }
         launchDashboardHome();
+        // Boot: dismiss the fresh keyguard with the same real-swipe fix as
+        // the wake paths (only a user swipe sticks on this build; without
+        // it the boot keyguard reasserts on the first screen-off timeout).
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    new ScreenController(getApplication()).dismissKeyguardSwipe();
+                } catch (Exception ignored) {
+                }
+            }
+        }, "boot-keyguard-swipe").start();
         finish();
     }
 

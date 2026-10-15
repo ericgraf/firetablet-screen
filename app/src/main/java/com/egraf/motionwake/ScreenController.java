@@ -173,7 +173,11 @@ final class ScreenController {
         }
     }
 
-    private int mInjectSeq = 0;
+    /** Unique sequence for injector-activity results — the static record in
+     *  the activities persists across instances, so the seq must be global
+     *  to avoid reading a stale completed run. */
+    private static final java.util.concurrent.atomic.AtomicInteger INJECT_SEQ =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     /**
      * Inject a key event on a transparent KeyInjector activity (InputManager
@@ -181,26 +185,23 @@ final class ScreenController {
      * Returns true if the event pair was accepted.
      */
     private boolean injectKeycode(int keycode) {
-        final int seq = mInjectSeq++;
+        return injectKeycode(keycode, false);
+    }
+
+    private boolean injectKeycode(int keycode, boolean injectAlways) {
+        final int seq = INJECT_SEQ.getAndIncrement();
         try {
             android.content.Intent i = new android.content.Intent(mApp, KeyInjector.class);
             i.putExtra("seq", seq);
             i.putExtra("keycode", keycode);
+            i.putExtra("inject_always", injectAlways);
             i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK
                     | android.content.Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
             // Start the injector task BEHIND the foreground task (see the
             // note in KeyInjector.onCreate): Fire's focus walk then resolves
             // to a NULL focus window while the injector is alive, and
             // InputDispatcher accepts our events without INJECT_EVENTS.
-            // (setLaunchTaskBehind is @hide in the SDK stubs — reflect it.)
-            android.app.ActivityOptions opts = android.app.ActivityOptions.makeBasic();
-            try {
-                java.lang.reflect.Method m =
-                        android.app.ActivityOptions.class.getMethod("setLaunchTaskBehind", boolean.class);
-                opts = (android.app.ActivityOptions) m.invoke(opts, true);
-            } catch (Throwable ignored) {
-            }
-            mApp.startActivity(i, opts.toBundle());
+            mApp.startActivity(i, taskBehindOptions().toBundle());
             // The injector stays alive until the screen state flips (<=~4s).
             long deadline = SystemClock.uptimeMillis() + 8000L;
             while (SystemClock.uptimeMillis() < deadline) {
@@ -215,6 +216,144 @@ final class ScreenController {
             return false;
         } catch (Exception e) {
             Log.w(TAG, "inject keycode " + keycode + " failed", e);
+            return false;
+        }
+    }
+
+    /** ActivityOptions with setLaunchTaskBehind(true) — @hide in the SDK
+     *  stubs, so reflect it. See the note in KeyInjector.onCreate for why
+     *  task-behind launch makes unprivileged input injection work. */
+    private static android.app.ActivityOptions taskBehindOptions() {
+        android.app.ActivityOptions opts = android.app.ActivityOptions.makeBasic();
+        try {
+            java.lang.reflect.Method m =
+                    android.app.ActivityOptions.class.getMethod(
+                            "setLaunchTaskBehind", boolean.class);
+            opts = (android.app.ActivityOptions) m.invoke(opts, true);
+        } catch (Throwable ignored) {
+        }
+        return opts;
+    }
+
+    /**
+     * Dismiss the system keyguard and make it STICK. No-op (returns true)
+     * when the keyguard is not up.
+     *
+     * Called on EVERY wake path (motion, API/HA, notification) and at boot:
+     * on this build only a user-style dismissal makes it sticky
+     * (offReason=USER — it then survives subsequent sleep cycles), and the
+     * keyguard while up pins the display's screen-off timeout to 10 s.
+     *
+     * Strategies (this build, in order):
+     *   1. AmazonKeyguardService transaction 5 via 'service call' —
+     *      Amazon's internal keyguard binder (dismiss works from shell uid;
+     *      from our app uid the service currently rejects the pid — kept as
+     *      a cheap probe in case the allowlist widens).
+     *   2. Our AccessibilityService (MwA11y): GLOBAL_ACTION_BACK, then the
+     *      proven swipe-up gesture — dispatched by the a11y framework
+     *      itself (trusted path, no INJECT_EVENTS/uid checks). The channel
+     *      of choice when the app's own uid is not dispatch-trusted.
+     *   3. KEYCODE_BACK through the KeyInjector null-focus KEY path.
+     *   4. MOTION swipe-up (KeyguardSwipe) — needs the dispatcher to accept
+     *      our uid for the topmost window (INJECT_EVENTS territory).
+     *   5. 'input swipe' binary as our uid (same probe, different code path).
+     */
+    boolean dismissKeyguardSwipe() {
+        if (!KeyguardSwipe.keyguardShowing(mApp)) {
+            Log.i(TAG, "keyguard dismiss: not showing — no-op");
+            return true;
+        }
+        if (KeyguardSwipe.dismissViaAmazonService(mApp)) {
+            Log.i(TAG, "keyguard dismissed via AmazonKeyguardService");
+            return true;
+        }
+        if (MwA11y.available()) {
+            MwA11y.globalBack();
+            if (waitForKeyguardGone(1500L)) {
+                Log.i(TAG, "keyguard dismissed via a11y GLOBAL_ACTION_BACK");
+                return true;
+            }
+            if (MwA11y.swipeUp(mApp) && waitForKeyguardGone(2500L)) {
+                Log.i(TAG, "keyguard dismissed via a11y swipe gesture");
+                return true;
+            }
+            Log.i(TAG, "a11y back+swipe did not dismiss — next strategy");
+        }
+        if (dismissKeyguardByKey()) {
+            return true;
+        }
+        try {
+            int seq = INJECT_SEQ.getAndIncrement();
+            Intent i = new Intent(mApp, KeyguardSwipe.class);
+            i.putExtra("seq", seq);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+            mApp.startActivity(i, taskBehindOptions().toBundle());
+            // KeyguardSwipe finishes as soon as the keyguard is gone or the
+            // budget runs out (<=~4s normally).
+            long deadline = SystemClock.uptimeMillis() + 8000L;
+            while (SystemClock.uptimeMillis() < deadline) {
+                if (KeyguardSwipe.isDone(seq)) {
+                    boolean ok = KeyguardSwipe.resultOk(seq);
+                    Log.i(TAG, "keyguard swipe dismiss ok=" + ok);
+                    if (ok) {
+                        return true;
+                    }
+                    break;
+                }
+                Thread.sleep(50L);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "keyguard swipe dismiss failed", e);
+        }
+        if (KeyguardSwipe.swipeViaShell(mApp)) {
+            return true;
+        }
+        Log.w(TAG, "keyguard dismiss: all strategies failed, still showing="
+                + KeyguardSwipe.keyguardShowing(mApp));
+        return false;
+    }
+
+    /** Poll until the keyguard no longer shows (or the budget runs out). */
+    private boolean waitForKeyguardGone(long ms) {
+        long deadline = SystemClock.uptimeMillis() + ms;
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (!KeyguardSwipe.keyguardShowing(mApp)) {
+                return true;
+            }
+            try {
+                Thread.sleep(100L);
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+        return !KeyguardSwipe.keyguardShowing(mApp);
+    }
+
+    /**
+     * Strategy 1: injected BACK key through the KeyInjector key path.
+     * NOTE: use the LITERAL 111 — the vendored android.jar in this project
+     * defines KEYCODE_BACK=4 (verified on-device: 'input keyevent 111'
+     * dismisses the lock screen; the jar constant would inject UNKNOWN).
+     */
+    private static final int KEY_BACK_REAL = 111;
+
+    private boolean dismissKeyguardByKey() {
+        try {
+            boolean injected = injectKeycode(KEY_BACK_REAL, true);
+            Log.i(TAG, "keyguard KEY_BACK injected ok=" + injected);
+            long deadline = SystemClock.uptimeMillis() + 4000L;
+            while (SystemClock.uptimeMillis() < deadline) {
+                if (!KeyguardSwipe.keyguardShowing(mApp)) {
+                    Log.i(TAG, "keyguard dismissed via KEY_BACK");
+                    return true;
+                }
+                Thread.sleep(100L);
+            }
+            Log.w(TAG, "keyguard still showing after KEY_BACK");
+            return false;
+        } catch (Exception e) {
+            Log.w(TAG, "keyguard KEY_BACK dismiss failed", e);
             return false;
         }
     }
