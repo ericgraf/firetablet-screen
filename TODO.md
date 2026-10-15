@@ -119,17 +119,26 @@ Root cause (empirical, this Fire build):
       sleep (was awake 100% of the 3h window at 0.6), spurious wakes drop
       34%→0.5% of cycles. Watch one evening; fallbacks if needed:
       2.2 (1.4% cross) / 2.8 (0.4% cross). B stays 3.0.
-- [ ] Re-run E2E after the threshold change: idle ≥10 min → sleep (no false
-      wakes over an evening), real motion → wake + dashboard reload. B is
-      already exercising this (26 wake/sleep cycles during the monitor).
+- [x] Re-run E2E after the threshold change (done 2026-10-15 16:10):
+      A reached its **10-min idle → ASLEEP** for the first time since the
+      3h window (asleep, keyguard `showing=false`, no false wakes across
+      the idle — at thr 0.6 A was awake 100% of that window); then
+      `/wake` → awake, keyguard dismissed on wake, `fire-6` dashboard
+      verified by screenshot. Motion→wake side covered by B's 26 real
+      wake/sleep cycles during the monitor. One-evening watch still
+      recommended before considering it fully settled.
 
 ## HA login (done for A, do for B if B is a wall)
 - [x] A: logged in as `fire-1`, wall dashboard (Fire-6 view) renders.
       Some cards show red error badges (entities unavailable) — cosmetic;
       check in HA if it bothers.
-- [ ] B: log in too if its dashboard is used as wall (B screen was black
+- [x] B: logged in too if its dashboard is used as wall (B screen was black
       after HA-wake at 17:11 — verify `fire-6` view renders on B; if B's
       session isn't logged in, do the same adb login steps as A).
+      - [x] VERIFIED 2026-10-15 16:05: B wakes on demand (keyguard
+            dismissed on wake, `showing=false`), HA session alive as
+            `fire-1`, `fire-6` view renders full dashboard. Both tablets
+            point at `http://silver:8123/wall-tablets/fire-6`.
 
 ## OTA update — DONE (2026-10-15, v2.6/code 17 on A & B, verified over LAN)
 Goal: ship a new build to A/B over the LAN, no USB. ✅ Shipped.
@@ -180,15 +189,24 @@ Goal: ship a new build to A/B over the LAN, no USB. ✅ Shipped.
 - Code: 98fd304 (main, pushed).
 
 ### Follow-ups
-- [ ] HA `button.mw_*_ota` entity: host runs `scripts/ota-update.sh`
-      (HA holds the APK; trigger = HA → webhook/cron → script).
+- [ ] HA `button.mw_*_ota` entity — FEASIBILITY CONFIRMED (2026-10-15):
+      calvin (192.168.50.97, same /20 as the tablets) is the OTA
+      controller (repo + adb + APK + authorized keys); HA container has
+      `ssh`+`curl` (Alpine). Design: HA integration exposes
+      `button.mw_<x>_ota` → `shell_command` domain:
+      `ssh calvin 'cd /home/egraf/scripts/firetablet-app &&
+      ./scripts/ota-update.sh <A|B>'` (HA→calvin key setup + a shell
+      command config per tablet, script logs to a file HA can tail).
+      Fallback if ssh keying is fiddly: tiny HTTP trigger on calvin.
 - [ ] Nice-to-have: app self-heals adbd-TCP after reboots (speak ADB
       protocol to its own adbd over 127.0.0.1:5555 with a staged host RSA
       key) — removes the one post-reboot USB touch.
 
 ## Housekeeping
-- [ ] README: document the two device quirks + deploy.sh keyguard swipe
+- [x] README: document the two device quirks + deploy.sh keyguard swipe
       step (camera visible-activity gate; keyguard 10 s timeout pin)
+      — done 2026-10-15 (new README sections: Keyguard dismissal,
+      Camera self-heal, OTA updates over LAN; threshold-tuning guidance).
 - [x] Re-verify keyguard dismissal on EVERY wake + boot, not one-time
       (KEYGUARD section above)
 - [ ] HACS repo: tag new version once behavior/docs change
