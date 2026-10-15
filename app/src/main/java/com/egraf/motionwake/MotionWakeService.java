@@ -40,6 +40,9 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     public static final String PREF_CHECK_SECONDS = "check_seconds";
     public static final String PREF_AUTO_START = "auto_start";
     public static final String PREF_API_TOKEN = "api_token";
+    public static final String PREF_OTA_ATTEMPT_TS = "ota_attempt_ts";
+    public static final String PREF_OTA_APPLIED_TS = "ota_applied_ts";
+    public static final String PREF_OTA_LAST_RESULT = "ota_last_result";
 
     public static final float DEFAULT_THRESHOLD = 3f;
     public static final float MIN_THRESHOLD = 0.5f;
@@ -129,6 +132,10 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         // 10 s (its window's userActivityTimeout) and leaves our activity
         // stopped behind it — a state the camera policy rejects.
         ensureKeyguardDisabled();
+
+        // If we were just self-updated (pm path), collect the install result
+        // written by the detached child for /update/status.
+        collectOtaResult();
     }
 
     private void ensureKeyguardDisabled() {
@@ -384,8 +391,24 @@ public final class MotionWakeService extends Service implements MotionCameraMana
                         mPrefs.getFloat(PREF_THRESHOLD, DEFAULT_THRESHOLD)) + ","
                 + "\"check_seconds\":" + checkSecondsFromPrefs(mPrefs) + ","
                 + "\"port\":" + ApiServer.DEFAULT_PORT + ","
-                + "\"version\":\"" + versionNameJson() + "\""
+                + "\"version\":\"" + versionNameJson() + "\","
+                // LAN ADB transport (over-the-air OTA channel). Empty after a
+                // reboot until `adb tcpip 5555` is re-run once over USB —
+                // monitoring (HA/cron) can use this to notice + re-enable.
+                + "\"adb_tcp\":\"" + escapeJson(adbTcpProp()) + "\""
                 + "}";
+    }
+
+    /** service.adb.tcp.port via hidden API (read-only; "" if unset). */
+    private static String adbTcpProp() {
+        try {
+            java.lang.reflect.Method m = Class.forName("android.os.SystemProperties")
+                    .getMethod("get", String.class);
+            Object v = m.invoke(null, "service.adb.tcp.port");
+            return v == null ? "" : v.toString();
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     private String versionNameJson() {
@@ -482,6 +505,830 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         } catch (Exception ignored) {
         }
         return statusJson();
+    }
+
+    // ------------------------------------------------------------ OTA update
+
+    private static final long OTA_MIN_BYTES = 64L * 1024L;
+
+    /**
+     * Self-update over HTTP (ApiServer POST /update).
+     *
+     * Why /data/local/tmp is the channel that works on these Fire builds:
+     * the framework registers NO `package_installer` service (checked all
+     * 230 registered services), so the Java PackageInstaller API is gone;
+     * the IPackageInstaller client interface is stripped to just
+     * `uninstall`; and the pm shell session commands each hit a wall for
+     * an app uid (reverse/stdin write needs SHELL/ROOT/SYSTEM; the
+     * PATH write makes the SERVER open the file, and its file-context
+     * allow-list rejects our own `app_data_file` and `media_rw_data_file`
+     * — it explicitly endorses `/data/local/tmp`, i.e. `shell_data_file`).
+     *
+     * So the primary channel is: stage the APK bytes into a pre-created
+     * world-writable file at /data/local/tmp (bootstrapped once by
+     * deploy.sh, see localTmpPmInstall), then run `pm install -r` on it
+     * as OUR OWN uid. The server reads shell_data_file fine, -r keeps our
+     * data, and the same signing key is retained (release over release).
+     *
+     * The command runs as a DETACHED sh child so it survives us being
+     * killed mid-replace, and it records rc + stdout/stderr in files
+     * under our private dir; the next process instance (relaunched by the
+     * MY_PACKAGE_REPLACED broadcast via BootReceiver/BootStarter) reads
+     * them in collectOtaResult() and stamps /update/status.
+     *
+     * Fallback channels for builds without the /data/local/tmp quirk:
+     * the standard PackageInstaller double-commit (UpdateInstaller
+     * activity + UpdateDoneReceiver), the pm session commands, and a
+     * multi-location `pm install -r <path>` sweep.
+     *
+     * Requires the SAME signing key as the installed build (release over
+     * release in our setup); a signature change needs an uninstall first.
+     */
+    public String apiUpdate(byte[] apk) {
+        if (apk == null || apk.length < OTA_MIN_BYTES) {
+            return "{\"ok\":false,\"error\":\"body too small to be an APK ("
+                    + (apk == null ? 0 : apk.length) + " bytes)\"}";
+        }
+        if ((apk[0] & 0xFF) != 0x50 || (apk[1] & 0xFF) != 0x4B) {
+            return "{\"ok\":false,\"error\":\"not a ZIP/APK (missing PK header)\"}";
+        }
+        // 1) Stage the APK where pm (running as our own uid) can read it.
+        final java.io.File dir = getFilesDir();
+        final java.io.File apkFile = new java.io.File(dir, "self-update.apk");
+        final java.io.File outLog = new java.io.File(dir, "update.out");
+        final java.io.File rcFile = new java.io.File(dir, "update.rc");
+        try {
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(apkFile);
+            try {
+                fos.write(apk);
+                fos.flush();
+            } finally {
+                fos.close();
+            }
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":\"staging apk file failed: \""
+                    + escapeJson(String.valueOf(e)) + "\"}";
+        }
+        outLog.delete();
+        rcFile.delete();
+        mPrefs.edit()
+                .putLong(PREF_OTA_ATTEMPT_TS, System.currentTimeMillis())
+                .putLong(PREF_OTA_APPLIED_TS, 0L)
+                .remove(PREF_OTA_LAST_RESULT)
+                .apply();
+        // 2) PRIMARY: pm install -r of a file under /data/local/tmp
+        //    (shell_data_file — the one context the server's file-context
+        //    allow-list accepts). See localTmpPmInstall for why this wins.
+        String viaLocalTmp = localTmpPmInstall(apk, outLog, rcFile);
+        if (isOtaOk(viaLocalTmp)) {
+            return viaLocalTmp;
+        }
+        // 3) Standard PackageInstaller channel, when the service is
+        //    registered at runtime (null on these builds).
+        String pis = tryPackageInstallerUpdate(apk);
+        if (pis != null) {
+            return pis;
+        }
+        // 4) Session-based pm install (create/write/commit).
+        String viaSession = sessionPmInstall(apk, apkFile, outLog, rcFile);
+        if (isOtaOk(viaSession)) {
+            return viaSession;
+        }
+        // 5) Fallback: classic `pm install -r <path>` multi-location sweep.
+        String viaPm = pmInstallMultiStage(apk, apkFile, outLog, rcFile);
+        if (isOtaOk(viaPm)) {
+            return viaPm;
+        }
+        StringBuilder all = new StringBuilder();
+        all.append("localtmp: ").append(otaErrText(viaLocalTmp)).append(" | ");
+        all.append("session-pm: ").append(otaErrText(viaSession)).append(" | ");
+        all.append("path-pm: ").append(otaErrText(viaPm));
+        String failMsg = all.toString();
+        mPrefs.edit().putString(PREF_OTA_LAST_RESULT, failMsg).commit();
+        return "{\"ok\":false,\"error\":\"" + escapeJson(failMsg) + "\"}";
+    }
+
+    /**
+     * PRIMARY install channel: `pm install -r` of a file staged under
+     * /data/local/tmp.
+     *
+     * The server (system_server) opens the apk path itself when running a
+     * pm install, and its file-context broker accepts only certain
+     * contexts — /data/local/tmp (shell_data_file) is the one it
+     * endorses. Our own app_data_file and media_rw_data_file are rejected.
+     *
+     * The target file is pre-created once by deploy.sh as world-writable
+     * (666) at /data/local/tmp/mw-ota.apk. The app (uid u0_aNNN, "other"
+     * on the shell:shell 0775 dir) can't CREATE a file there, but it CAN
+     * truncate+write an EXISTING 666 file — and that's all we need.
+     *
+     * Runs as a DETACHED sh child (survives us being replaced); we wait
+     * for its rc.
+     */
+    private String localTmpPmInstall(byte[] apk,
+                                     java.io.File outLog, java.io.File rcFile) {
+        final java.io.File dest = new java.io.File("/data/local/tmp", "mw-ota.apk");
+        // Stage the bytes into the pre-created shared file (truncate+write).
+        try {
+            java.io.FileOutputStream fos = new java.io.FileOutputStream(dest, false);
+            try {
+                fos.write(apk);
+                fos.flush();
+            } finally {
+                try {
+                    fos.close();
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "localTmpPmInstall: stage to " + dest + " failed: " + e);
+            return "{\"ok\":false,\"error\":\"localtmp stage failed: \""
+                    + escapeJson(String.valueOf(e)) + "\"}";
+        }
+        outLog.delete();
+        rcFile.delete();
+        final long t0 = System.currentTimeMillis();
+        final String q = "'";
+        final String cmd = "/system/bin/pm install -r " + q + dest.getAbsolutePath() + q
+                + " > " + q + outLog.getAbsolutePath() + q + " 2>&1"
+                + "; echo $? > " + q + rcFile.getAbsolutePath() + q;
+        try {
+            java.lang.Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd});
+        } catch (Exception e) {
+            return "{\"ok\":false,\"error\":\"localtmp launch failed: \""
+                    + escapeJson(String.valueOf(e)) + "\"}";
+        }
+        String rc = null;
+        long deadline = System.currentTimeMillis() + 30000L;
+        while (System.currentTimeMillis() < deadline) {
+            if (rcFile.exists()) {
+                rc = readFileTrim(rcFile);
+                break;
+            }
+            try {
+                Thread.sleep(250L);
+            } catch (InterruptedException ie) {
+                break;
+            }
+        }
+        if (rc == null) {
+            return "{\"ok\":false,\"error\":\"localtmp: timeout waiting for rc\"}";
+        }
+        String head = headOf(outLog, 400);
+        if ("0".equals(rc.trim())) {
+            Log.i(TAG, "OTA: pm install succeeded from " + dest
+                    + " in " + (System.currentTimeMillis() - t0) + "ms");
+            mPrefs.edit().putString(PREF_OTA_LAST_RESULT, "pm ok from " + dest).apply();
+            // Clean up the shared staging file (best effort).
+            try {
+                dest.delete();
+            } catch (Exception ignored) {
+            }
+            return "{\"ok\":true,\"state\":\"installing\",\"via\":\"localtmp\","
+                    + "\"bytes\":" + apk.length + "}";
+        }
+        return "{\"ok\":false,\"error\":\"localtmp pm rc=" + rc + " ["
+                + head.replace("\n", " ").trim() + "]\"}";
+    }
+
+    private static boolean isOtaOk(String json) {
+        return json != null && json.indexOf("\"ok\":true") >= 0;
+    }
+
+    private static String otaErrText(String json) {
+        if (json == null) {
+            return "no response";
+        }
+        int i = json.indexOf("\"error\":\"");
+        if (i < 0) {
+            return json;
+        }
+        i += "\"error\":\"".length();
+        int j = json.indexOf('"', i);
+        return j > 0 ? json.substring(i, j) : json.substring(i);
+    }
+
+    /**
+     * Session-based self-install via the pm shell session commands
+     * (available on these Fire builds; `pm help`):
+     *
+     *   pm install-create -r -S <bytes>        → "… install session [ID]"
+     *   pm install-write -S <bytes> ID base.apk -   (reads APK from STDIN)
+     *   pm install-commit ID
+     *
+     * Staged file is only READ locally (by the sh child, which runs as
+     * our uid — app_data_file is fine there); the server streams it in
+     * from the pipe, so its file-context allow-list never applies.
+     *
+     * Runs as a DETACHED sh child (survives our process being replaced);
+     * we wait for its rc. Result is still picked up by
+     * collectOtaResult()/UpdateDoneReceiver for /update/status.
+     */
+    private String sessionPmInstall(byte[] apk, java.io.File staged,
+                                    java.io.File outLog, java.io.File rcFile) {
+        try {
+            final long size = apk.length;
+            String pkg = getPackageName();
+            String q = "'";
+            String stagedPath = staged.getAbsolutePath();
+            String body = ""
+                    + "set +e\n"
+                    + "create_out=$(/system/bin/pm install-create -r -S " + size
+                    + " --user 0 -i " + pkg + " 2>&1)\n"
+                    + "echo \"[install-create] $create_out\"\n"
+                    + "sid=$(printf '%s\\n' \"$create_out\" | sed -n 's/.*session \\[\\([0-9]*\\)\\].*/\\1/p')\n"
+                    + "if [ -z \"$sid\" ]; then echo no-session-id; exit 1; fi\n"
+                    + "echo using-session $sid\n"
+                    + "if ! /system/bin/pm install-write -S " + size + " \"$sid\" base.apk "
+                    + q + stagedPath + q + "; then\n"
+                    + "  /system/bin/pm install-abandon \"$sid\" 2>/dev/null\n"
+                    + "  echo install-write-failed\n"
+                    + "  exit 2\n"
+                    + "fi\n"
+                    + "if ! /system/bin/pm install-commit \"$sid\"; then\n"
+                    + "  echo install-commit-failed\n"
+                    + "  exit 3\n"
+                    + "fi\n"
+                    + "echo ota-session-committed\n";
+            outLog.delete();
+            rcFile.delete();
+            // `( ... )` SUBSHELL so `exit N` inside leaves the outer
+            // `rc=$?`/`echo $rc > file` intact.
+            String script = "(\n" + body + "\n) > " + q + outLog.getAbsolutePath() + q
+                    + " 2>&1\n"
+                    + "rc=$?\n"
+                    + "echo $rc > " + q + rcFile.getAbsolutePath() + q + "\n";
+            java.lang.Runtime.getRuntime()
+                    .exec(new String[]{"sh", "-c", script});
+            long deadline = System.currentTimeMillis() + 30000L;
+            String r = null;
+            while (System.currentTimeMillis() < deadline) {
+                if (rcFile.exists()) {
+                    r = readFileTrim(rcFile);
+                    break;
+                }
+                try {
+                    Thread.sleep(250L);
+                } catch (InterruptedException ie) {
+                    break;
+                }
+            }
+            if (r == null) {
+                return "{\"ok\":false,\"error\":\"ota session: timeout waiting for rc\"}";
+            }
+            String head = headOf(outLog, 500);
+            if ("0".equals(r.trim())) {
+                Log.i(TAG, "OTA: install session committed "
+                        + "(pm install-create/write/commit, " + size + " bytes)");
+                return "{\"ok\":true,\"state\":\"installing\",\"via\":\"session-pm\","
+                        + "\"bytes\":" + size + "}";
+            }
+            return "{\"ok\":false,\"error\":\"ota session rc=" + r + " ["
+                    + head.replace("\n", " ").trim() + "]\"}";
+        } catch (Exception e) {
+            Log.w(TAG, "sessionPmInstall launch failed", e);
+            return "{\"ok\":false,\"error\":\"ota session launch failed: \""
+                    + escapeJson(String.valueOf(e)) + "\"}";
+        }
+    }
+
+    /**
+     * `pm install` self-install with multi-location staging.
+     *
+     * Each attempt runs as a DETACHED sh child (it survives us being
+     * killed mid-replace); we wait for its rc before trying the next
+     * location. Result files (update.rc / update.out, in our filesDir)
+     * are read by collectOtaResult() on the next start — and by the
+     * /update/status probe (self-healing); UpdateDoneReceiver
+     * (INITIALIZATION_COMPLETE) stamps `applied` regardless.
+     */
+    private String pmInstallMultiStage(byte[] apk, java.io.File staged,
+                                       java.io.File outLog, java.io.File rcFile) {
+        java.io.File[] locations = new java.io.File[3];
+        int n = 0;
+        try {
+            java.io.File ext = getExternalFilesDir(null);
+            if (ext != null) {
+                locations[n++] = new java.io.File(ext, "self-update.apk");
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            java.io.File sd = android.os.Environment.getExternalStorageDirectory();
+            if (sd != null) {
+                locations[n++] = new java.io.File(sd, "self-update.apk");
+            }
+        } catch (Throwable ignored) {
+        }
+        locations[n++] = staged; // app filesDir (last: rejected context here)
+
+        StringBuilder failures = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            final java.io.File dest = locations[i];
+            final String path = dest.getAbsolutePath();
+            try {
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(dest);
+                try {
+                    fos.write(apk);
+                    fos.flush();
+                } finally {
+                    try {
+                        fos.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+            } catch (Exception e) {
+                failures.append("stage ").append(path).append(" failed: ")
+                        .append(e).append("; ");
+                continue;
+            }
+            outLog.delete();
+            rcFile.delete();
+            final long t0 = System.currentTimeMillis();
+            try {
+                String q = "'";
+                String cmd = "/system/bin/pm install -r "
+                        + q + path + q
+                        + " > " + q + outLog.getAbsolutePath() + q + " 2>&1"
+                        + "; echo $? > " + q + rcFile.getAbsolutePath() + q;
+                java.lang.Runtime.getRuntime()
+                        .exec(new String[]{"sh", "-c", cmd});
+            } catch (Exception e) {
+                failures.append("launch ").append(path).append(" failed: ")
+                        .append(e).append("; ");
+                continue;
+            }
+            // Wait for the child to finish (pm fails fast on a bad file
+            // context; success takes a few seconds to replace the pkg).
+            String rc = null;
+            long deadline = System.currentTimeMillis() + 30000L;
+            while (System.currentTimeMillis() < deadline) {
+                if (rcFile.exists()) {
+                    rc = readFileTrim(rcFile);
+                    break;
+                }
+                try {
+                    Thread.sleep(250L);
+                } catch (InterruptedException ie) {
+                    break;
+                }
+            }
+            if (rc == null) {
+                failures.append("timeout waiting for pm at ").append(path).append("; ");
+                continue;
+            }
+            String head = headOf(outLog, 400);
+            if ("0".equals(rc.trim())) {
+                Log.i(TAG, "OTA: pm install succeeded from " + path
+                        + " in " + (System.currentTimeMillis() - t0) + "ms");
+                mPrefs.edit()
+                        .putString(PREF_OTA_LAST_RESULT,
+                                "pm ok from " + path)
+                        .apply();
+                return "{\"ok\":true,\"state\":\"installing\",\"via\":\"pm\","
+                        + "\"location\":\"" + escapeJson(path) + "\","
+                        + "\"bytes\":" + apk.length + "}";
+            }
+            failures.append("pm ").append(path).append(" rc=").append(rc)
+                    .append(" [").append(head.replace("\n", " ").trim())
+                    .append("]; ");
+        }
+        String failMsg = failures.toString().trim();
+        mPrefs.edit().putString(PREF_OTA_LAST_RESULT, failMsg).commit();
+        return "{\"ok\":false,\"error\":\"pm install failed: \""
+                + escapeJson(failMsg) + "\"}";
+    }
+
+    /**
+     * Standard PackageInstaller self-update (double commit: commit our own
+     * UpdateInstaller as the "confirmation" step, it issues the real
+     * commit; UpdateDoneReceiver stamps the applied ts). No install UI is
+     * ever shown — what an unattended wall tablet needs.
+     *
+     * Works on these Fire builds because PisBridge fetches the
+     * IPackageInstaller binder via
+     * ActivityThread.sPackageManager.getPackageInstaller() — the
+     * "package_installer" context service is not registered here, but the
+     * framework method is (verified via /update/diag).
+     *
+     * @return a response JSON, or null when the PIS binder is not
+     *         available at all (caller falls back to `pm install`).
+     */
+    private String tryPackageInstallerUpdate(byte[] apk) {
+        Object pis = PisBridge.installer();
+        if (pis == null) {
+            return null;
+        }
+        try {
+            android.content.pm.PackageInstaller.SessionParams params =
+                    new android.content.pm.PackageInstaller.SessionParams(
+                            android.content.pm.PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            otaSetAppId(params, getPackageName());
+            int sessionId = PisBridge.createSession(pis, params);
+            if (sessionId < 0) {
+                // The binder exists but the session methods were stripped
+                // from the runtime interface (these Fire builds expose only
+                // `uninstall`) — let the caller fall back to pm install.
+                Log.w(TAG, "PIS session surface unavailable — falling back to pm");
+                return null;
+            }
+            Object session = PisBridge.openSession(pis, sessionId);
+            if (session == null) {
+                return "{\"ok\":false,\"error\":\"could not open install session "
+                        + sessionId + "\"}";
+            }
+            try {
+                PisBridge.writeThrough(session, "motionwake-update.apk", apk);
+                PisBridge.sessionSeal(session);
+            } catch (Throwable e) {
+                try {
+                    PisBridge.sessionAbandon(session);
+                } catch (Exception ignored) {
+                }
+                return "{\"ok\":false,\"error\":\"session write failed: "
+                        + escapeJson(String.valueOf(e)) + "\"}";
+            }
+            android.content.Intent installIntent =
+                    new android.content.Intent(this, UpdateInstaller.class);
+            installIntent.putExtra("sid", sessionId);
+            installIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            android.app.PendingIntent pi = android.app.PendingIntent.getActivity(
+                    this,
+                    UpdateInstaller.STAGE2_REQUEST + 1000,
+                    installIntent,
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                            | android.app.PendingIntent.FLAG_IMMUTABLE);
+            PisBridge.sessionCommit(session, pi.getIntentSender());
+            Log.i(TAG, "OTA: committed update session " + sessionId
+                    + " (" + apk.length + " bytes)");
+            return "{\"ok\":true,\"state\":\"committing\",\"session\":"
+                    + sessionId + ",\"bytes\":" + apk.length + "}";
+        } catch (Throwable e) {
+            Log.w(TAG, "OTA (PIS path) failed", e);
+            return "{\"ok\":false,\"error\":\"" + escapeJson(String.valueOf(e)) + "\"}";
+        }
+    }
+
+    /**
+     * Collect the `pm install` result written by the detached update child
+     * (runs on every service start — a no-op when the files are absent).
+     * Success stamps the applied ts for /update/status; failure keeps the
+     * state "pending" with last_result as the diagnostic.
+     */
+    public void collectOtaResult() {
+        try {
+            final java.io.File dir = getFilesDir();
+            final java.io.File rcFile = new java.io.File(dir, "update.rc");
+            if (!rcFile.exists()) {
+                return;
+            }
+            final String rc = readFileTrim(rcFile);
+            // pm's error message (if any) is at the HEAD of the output.
+            final String head = headOf(new java.io.File(dir, "update.out"), 800);
+            final boolean ok = "0".equals(rc);
+            mPrefs.edit()
+                    .putString(PREF_OTA_LAST_RESULT,
+                            "pm rc=" + rc + (head.isEmpty() ? "" : " | " + head))
+                    .commit();
+            if (ok) {
+                mPrefs.edit()
+                        .putLong(PREF_OTA_APPLIED_TS, System.currentTimeMillis())
+                        .commit();
+            }
+            new java.io.File(dir, "update.out").delete();
+            new java.io.File(dir, "self-update.apk").delete();
+            rcFile.delete();
+            // Staging copies on external storage (survive the replace).
+            try {
+                java.io.File ext = getExternalFilesDir(null);
+                if (ext != null) {
+                    new java.io.File(ext, "self-update.apk").delete();
+                }
+                java.io.File sd = android.os.Environment.getExternalStorageDirectory();
+                if (sd != null) {
+                    new java.io.File(sd, "self-update.apk").delete();
+                }
+            } catch (Throwable ignored) {
+            }
+            Log.i(TAG, "OTA result collected: rc=" + rc + " ok=" + ok
+                    + " head=[" + head.trim() + "]");
+        } catch (Exception e) {
+            Log.w(TAG, "collectOtaResult failed", e);
+        }
+    }
+
+    private static String headOf(java.io.File f, int maxChars) {
+        try {
+            java.io.FileInputStream is = new java.io.FileInputStream(f);
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) > 0 && bos.size() < maxChars * 2) {
+                bos.write(buf, 0, n);
+            }
+            is.close();
+            String s = new String(bos.toByteArray(),
+                    java.nio.charset.StandardCharsets.UTF_8).replace('\n', '|').trim();
+            return s.length() > maxChars ? s.substring(0, maxChars) : s;
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private static String readFileTrim(java.io.File f) {
+        try {
+            java.io.FileInputStream is = new java.io.FileInputStream(f);
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+                if (bos.size() >= 4096) {
+                    break;
+                }
+            }
+            is.close();
+            return new String(bos.toByteArray(),
+                    java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * Diagnostic: reflect the install-related API surface available at
+     * runtime, so we can pick a working self-install channel without
+     * guessing. GET /update/diag.
+     */
+    public String diagJson() {
+        StringBuilder out = new StringBuilder("{\"ok\":true");
+        // 1) Amazon's own package manager binder.
+        Object amz = null;
+        try {
+            amz = (Object) getSystemService("amazonpackagemanager");
+        } catch (Exception ignored) {
+        }
+        if (amz != null && amz.getClass().getInterfaces().length > 0) {
+            out.append(",\"amz\":[");
+            java.lang.reflect.Method[] ms = amz.getClass().getInterfaces()[0].getMethods();
+            boolean first = true;
+            for (java.lang.reflect.Method m : ms) {
+                String name = m.getName();
+                if (!name.contains("install") && !name.contains("Install")
+                        && !name.contains("update") && !name.contains("Update")) {
+                    continue;
+                }
+                StringBuilder sig = new StringBuilder(name).append("(");
+                Class<?>[] ps = m.getParameterTypes();
+                for (int i = 0; i < ps.length; i++) {
+                    if (i > 0) {
+                        sig.append(",");
+                    }
+                    sig.append(ps[i].getName());
+                }
+                sig.append("):").append(m.getReturnType().getName());
+                if (!first) {
+                    out.append(",");
+                }
+                first = false;
+                out.append('"').append(escapeJson(sig.toString())).append('"');
+            }
+            out.append("]");
+        } else {
+            out.append(",\"amz\":null");
+        }
+        // 2) Framework IPackageManager (via ActivityThread static field).
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object pmProxy = null;
+            String fieldName = "";
+            for (java.lang.reflect.Field f : at.getDeclaredFields()) {
+                if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    continue;
+                }
+                if (!"android.content.pm.IPackageManager".equals(f.getType().getName())) {
+                    continue;
+                }
+                f.setAccessible(true);
+                pmProxy = f.get(null);
+                fieldName = f.getName();
+                break;
+            }
+            if (pmProxy != null && pmProxy.getClass().getInterfaces().length > 0) {
+                out.append(",\"pm_field\":\"").append(escapeJson(fieldName)).append("\",\"pm\":[");
+                boolean first = true;
+                for (java.lang.reflect.Method m : pmProxy.getClass().getInterfaces()[0].getMethods()) {
+                    String name = m.getName();
+                    if (name.indexOf("nstall") < 0) {
+                        continue;
+                    }
+                    StringBuilder sig = new StringBuilder(name).append("(");
+                    Class<?>[] ps = m.getParameterTypes();
+                    for (int i = 0; i < ps.length; i++) {
+                        if (i > 0) {
+                            sig.append(",");
+                        }
+                        sig.append(ps[i].getName());
+                    }
+                    sig.append("):").append(m.getReturnType().getName());
+                    if (!first) {
+                        out.append(",");
+                    }
+                    first = false;
+                    out.append('"').append(escapeJson(sig.toString())).append('"');
+                }
+                out.append("]");
+            } else {
+                out.append(",\"pm\":null");
+            }
+        } catch (Throwable e) {
+            out.append(",\"pm\":\"err:").append(escapeJson(String.valueOf(e))).append('"');
+        }
+        // 3) The IPackageInstaller binder itself (via PisBridge).
+        Object pis = PisBridge.installer();
+        if (pis != null) {
+            out.append(",\"pis_class\":\"").append(escapeJson(pis.getClass().getName())).append("\"");
+            out.append(",\"pis\":[");
+            boolean first = true;
+            for (java.lang.reflect.Method m : pis.getClass().getMethods()) {
+                if (first) {
+                    first = false;
+                } else {
+                    out.append(",");
+                }
+                String name = m.getName();
+                if (out.length() > 2500) {
+                    break;
+                }
+                out.append('"').append(escapeJson(name)).append('"');
+            }
+            out.append("]");
+        } else {
+            out.append(",\"pis\":null");
+        }
+        // 4) OTA staging state (for debugging pm install failures).
+        try {
+            java.io.File st = new java.io.File(getFilesDir(), "self-update.apk");
+            java.io.File uo = new java.io.File(getFilesDir(), "update.out");
+            java.io.File ur = new java.io.File(getFilesDir(), "update.rc");
+            out.append(",\"staged\":{\"exists\":").append(st.exists())
+                    .append(",\"len\":").append(st.length()).append("}");
+            out.append(",\"rc_file\":").append(ur.exists()
+                    ? "\"" + escapeJson(readFileTrim(ur)) + "\"" : "false");
+            if (uo.exists()) {
+                out.append(",\"update_out\":\"").append(escapeJson(headOf(uo, 700))).append("\"");
+            }
+            String exts = null;
+            try {
+                java.io.File e = getExternalFilesDir(null);
+                exts = e == null ? "null" : e.getAbsolutePath();
+            } catch (Throwable t) {
+                exts = "err:" + t;
+            }
+            String sds = null;
+            try {
+                java.io.File s = android.os.Environment.getExternalStorageDirectory();
+                sds = s == null ? "null" : s.getAbsolutePath();
+            } catch (Throwable t) {
+                sds = "err:" + t;
+            }
+            out.append(",\"ext_dir\":\"").append(escapeJson(String.valueOf(exts))).append("\"");
+            out.append(",\"sd_dir\":\"").append(escapeJson(String.valueOf(sds))).append("\"");
+        } catch (Throwable t) {
+            out.append(",\"staging\":\"err:").append(escapeJson(String.valueOf(t))).append("\"");
+        }
+        out.append("}");
+        return out.toString();
+    }
+
+    /** GET /update/status — current version + last OTA attempt/result. */
+    public String updateStatusJson() {
+        // Self-healing probe: the detached pm child can finish (and write
+        // its result files) just after our post-replace start — collect on
+        // every check, not only in onCreate (no-op when nothing pending).
+        collectOtaResult();
+        String version = "0";
+        try {
+            android.content.pm.PackageInfo info =
+                    getPackageManager().getPackageInfo(getPackageName(), 0);
+            version = String.valueOf(info.versionCode);
+        } catch (Exception ignored) {
+        }
+        long attempt = mPrefs.getLong(PREF_OTA_ATTEMPT_TS, 0L);
+        long applied = mPrefs.getLong(PREF_OTA_APPLIED_TS, 0L);
+        String state = attempt == 0L
+                ? "none"
+                : (applied > attempt) ? "applied" : "pending";
+        String lastResult = mPrefs.getString(PREF_OTA_LAST_RESULT, "");
+        return "{\"ok\":true,\"version\":" + version + ",\"state\":\"" + state
+                + "\",\"attempt_ts\":" + attempt + ",\"applied_ts\":" + applied
+                + ",\"last_result\":\"" + escapeJson(lastResult) + "\"}";
+    }
+
+    /** Open the session's APK file for writing, handling the return-type
+     *  variance (OutputStream on this jar, ParcelFileDescriptor on older
+     *  runtimes) by reflection. */
+    private static java.io.OutputStream otaOpenWrite(
+            android.content.pm.PackageInstaller.Session session, String name)
+            throws Exception {
+        java.lang.reflect.Method m = null;
+        for (java.lang.reflect.Method x
+                : android.content.pm.PackageInstaller.Session.class.getMethods()) {
+            if (x.getName().equals("openWrite") && x.getParameterTypes().length == 3) {
+                m = x;
+                break;
+            }
+        }
+        if (m == null) {
+            throw new IllegalStateException("Session.openWrite not found");
+        }
+        Object w;
+        try {
+            w = m.invoke(session, name, 0L, -1L);
+        } catch (java.lang.reflect.InvocationTargetException ite) {
+            Throwable c = ite.getCause() != null ? ite.getCause() : ite;
+            throw new Exception("openWrite failed: " + c, c);
+        }
+        if (w instanceof java.io.OutputStream) {
+            return (java.io.OutputStream) w;
+        }
+        android.os.ParcelFileDescriptor pfd = (android.os.ParcelFileDescriptor) w;
+        return new java.io.FileOutputStream(pfd.getFileDescriptor());
+    }
+
+    /** Attach the creating-app id (jar: setAppPackageName, newer runtimes:
+     *  setAppId) — reflect whichever exists. */
+    private static void otaSetAppId(android.content.pm.PackageInstaller.SessionParams params,
+            String pkg) {
+        for (String m : new String[]{"setAppPackageName", "setAppId"}) {
+            try {
+                params.getClass().getMethod(m, String.class).invoke(params, pkg);
+                return;
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** Create the install session (jar: createSession; older semantics:
+     *  openSession(SessionParams)) — reflect whichever exists. */
+    private static int otaCreateSession(android.content.pm.PackageInstaller installer,
+            android.content.pm.PackageInstaller.SessionParams params) throws Exception {
+        for (String m : new String[]{"createSession", "openSession"}) {
+            try {
+                Object r = installer.getClass().getMethod(m,
+                        android.content.pm.PackageInstaller.SessionParams.class)
+                        .invoke(installer, params);
+                return ((Number) r).intValue();
+            } catch (java.lang.NoSuchMethodException ignored) {
+            }
+        }
+        throw new IllegalStateException("createSession/openSession not found");
+    }
+
+    /** Seal the session (fseal() on the device runtime, the deprecated
+     *  fsync(os) variant on the vendored jar) — reflect whichever exists.
+     *  The stream has already been closed by the caller. */
+    private static void otaSeal(android.content.pm.PackageInstaller.Session session)
+            throws Exception {
+        try {
+            session.getClass().getMethod("fseal").invoke(session);
+            return;
+        } catch (java.lang.NoSuchMethodException ignored) {
+            // older/newer variant
+        }
+        try {
+            session.getClass().getMethod("fsync", java.io.OutputStream.class)
+                    .invoke(session, (Object) null);
+        } catch (java.lang.NoSuchMethodException nse) {
+            throw new IllegalStateException("Session.fseal/fsync not found");
+        }
+    }
+
+    /** Called by UpdateDoneReceiver after our process has been replaced. */
+    public static void markOtaApplied(android.content.Context app, long ts) {
+        try {
+            app.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit()
+                    .putLong(PREF_OTA_APPLIED_TS, ts)
+                    .commit();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static String escapeJson(String s) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '"' || c == '\\') {
+                b.append('\\');
+                b.append(c);
+            } else if (c < 0x20) {
+                b.append(' ');
+            } else {
+                b.append(c);
+            }
+        }
+        return b.toString();
     }
 
     /**

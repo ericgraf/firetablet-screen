@@ -10,6 +10,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- OTA staging: pm install refuses app_data_file, so we stage the APK
+         on external storage (app dir needs no permission; sdcard root does). -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <!-- Receive the install-finished broadcasts for our own package
+         (UpdateDoneReceiver, OTA /update path). -->
+    <uses-permission android:name="android.permission.PACKAGE_INSTALLS" />
     <!-- Amazon's keyguard binder (AmazonKeyguardService) requires one of
          these (prot=signature|amazon). Declared so pm grant can attach it
          at deploy; the service call then dismisses the keyguard directly. -->
@@ -143,6 +150,36 @@
             android:name=".MotionWakeService"
             android:exported="true"
             android:foregroundServiceType="camera" />
+
+        <!-- OTA self-update stage 2: PackageInstaller launches this as the
+             "confirmation" step; it immediately issues the real commit, so
+             no install UI is ever shown (see UpdateInstaller). -->
+        <activity
+            android:name=".UpdateInstaller"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Records install-finished signals for /update/status. Manifest
+             receiver on purpose: the old process dies mid-replace. -->
+        <receiver
+            android:name=".UpdateDoneReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.content.pm.action.SESSION_COMMITTED" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.content.pm.action.INITIALIZATION_COMPLETE" />
+                <data android:scheme="package" android:host="com.egraf.motionwake" />
+            </intent-filter>
+            <!-- Host-driven installs (adb install over LAN/USB) do not fire
+                 INITIALIZATION_COMPLETE; MY_PACKAGE_REPLACED is the signal
+                 that a pending in-app attempt was finished by the install. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Keyguard-dismiss channel: our own AccessibilityService. The a11y
              framework dispatches its gestures/keys with a trusted uid, so

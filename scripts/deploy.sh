@@ -37,8 +37,37 @@ SERIAL="${DEVICES[0]}"
 echo "==> Installing $APK → $SERIAL"
 adb -s "$SERIAL" install -r "$APK"
 
+echo "==> Preparing OTA staging slot (/data/local/tmp)"
+# The OTA self-update's primary channel is `pm install -r` of a file under
+# /data/local/tmp (shell_data_file — the one file context system_server's
+# file-context broker will read; it rejects our own app_data_file). SELinux
+# lets an app open+read+write an EXISTING world-writable file there but not
+# CREATE one (neverallow app create on shell_data_file), so we create it once
+# here, as shell, world-writable. The app truncates it during /update.
+adb -s "$SERIAL" shell "mkdir -p /data/local/tmp && touch /data/local/tmp/mw-ota.apk && chmod 666 /data/local/tmp/mw-ota.apk" 2>/dev/null || true
+adb -s "$SERIAL" shell "ls -l /data/local/tmp/mw-ota.apk" 2>/dev/null || true
+
+echo "==> Enabling the LAN ADB transport (port 5555) — OTA channel"
+# The OTA primary path is `adb install -r` streamed over adbd's TCP mode
+# (shell uid install — the only caller the Fire PMS file-context broker
+# accepts). `adb tcpip 5555` is non-persistent: after a REBOOT it is lost
+# (service.adb.tcp.port is unset; only shell/adbd domains can set it), and
+# ota-update.sh re-enables it via this USB transport as needed. Enable it
+# once now so the LAN works immediately.
+adb -s "$SERIAL" tcpip 5555 >/dev/null 2>&1 || true
+sleep 2
+TBL_IP="$(adb -s "$SERIAL" shell ip -4 addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/.*/\1/p' | head -1)"
+if [ -n "$TBL_IP" ]; then
+  adb connect "$TBL_IP:5555" >/dev/null 2>&1 || true
+  echo "    $TBL_IP:5555 $(adb devices 2>/dev/null | awk -v t="$TBL_IP:5555" '$1==t{print "up" " ("$2")"}' || true)"
+else
+  echo "    (could not resolve tablet IP — run: adb connect <ip>:5555)"
+fi
+
 echo "==> Granting runtime permissions"
 adb -s "$SERIAL" shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+adb -s "$SERIAL" shell pm grant "$PKG" android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null || true
+adb -s "$SERIAL" shell pm grant "$PKG" android.permission.READ_EXTERNAL_STORAGE 2>/dev/null || true
 # DEVICE_POWER is signature|privileged — used for IPowerManager.goToSleep()
 adb -s "$SERIAL" shell pm grant "$PKG" android.permission.DEVICE_POWER 2>/dev/null || true
 # WRITE_SETTINGS appop — lets the app toggle screen_off_timeout to trigger sleep

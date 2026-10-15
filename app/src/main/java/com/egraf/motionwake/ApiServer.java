@@ -17,6 +17,9 @@
  *   POST   /shutdown               stop monitor + service (API goes away)
  *   POST   /wake                   wake the display now (+ resets idle timer)
  *   POST   /sleep                  sleep the display now
+ *   POST   /update                 self-update: binary APK body; installs via
+ *                                  PackageInstaller and self-restarts
+ *   GET    /update/status          version + last OTA attempt/result
  *
  * Auth: `X-MotionWake-Token: <token>` header, or `?token=<token>` query param
  * (handy for plain curl). Token lives in the `motionwatch` prefs under
@@ -43,6 +46,9 @@ final class ApiServer {
     private static final String TAG = "MotionApi";
     private static final int MAX_HEADER_BYTES = 8 * 1024;
     private static final int MAX_BODY_BYTES = 64 * 1024;
+    /** APK upload (/update) — release build is ~200 KB; bound well above any
+     *  realistic build. */
+    private static final int MAX_UPDATE_BYTES = 64 * 1024 * 1024;
     private static final int SO_TIMEOUT_MS = 6000;
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
@@ -181,7 +187,9 @@ final class ApiServer {
             // 3) body (already-bounded). Surplus bytes from step 1 count.
             byte[] body = new byte[0];
             if (contentLength > 0) {
-                if (contentLength > MAX_BODY_BYTES) {
+                int maxBody = "/update".equals(path)
+                        ? MAX_UPDATE_BYTES : MAX_BODY_BYTES;
+                if (contentLength > maxBody) {
                     writeResponse(client, 413, "{\"ok\":false,\"error\":\"body too large\"}");
                     return;
                 }
@@ -291,6 +299,30 @@ final class ApiServer {
                 case "/browser/reload":
                     if (isPost) {
                         json = mService.apiBrowserReload();
+                    } else {
+                        status = 405;
+                        json = methodNotAllowed(method);
+                    }
+                    break;
+                case "/update":
+                    if (isPost) {
+                        json = mService.apiUpdate(body);
+                    } else {
+                        status = 405;
+                        json = methodNotAllowed(method);
+                    }
+                    break;
+                case "/update/status":
+                    if (isGet) {
+                        json = mService.updateStatusJson();
+                    } else {
+                        status = 405;
+                        json = methodNotAllowed(method);
+                    }
+                    break;
+                case "/update/diag":
+                    if (isGet) {
+                        json = mService.diagJson();
                     } else {
                         status = 405;
                         json = methodNotAllowed(method);
