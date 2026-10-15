@@ -62,18 +62,43 @@ Root cause (empirical, this Fire build):
       `update_interval` = timedelta, coordinator gets `config_entry`,
       entities carry `config_entry` + `unique_id` explicitly.
 
-## Long-term reliability verification — 3h capture DONE, analysis pending
-- [x] 3h monitor ran 2026-10-14 13:30→16:30 local:
-      `/tmp/opencode/mw-verify/` — `status.csv` (1035 rows, 10s cadence),
-      `logcat-A.log` (5.5 MB) / `logcat-B.log` (1.3 MB) with per-cycle
-      `MotionCamera ... diff=X.XX thr=...` (signal-strength ground truth).
-      B's `showing=true` regression is visible in the rows (matches the
-      keyguard bug now fixed on both tablets).
-- [ ] Analyze + report:
-      - quiet-noise diff distribution (logcat) vs MOTION DETECTED events;
-      - every awake→asleep transition + `mLastSleepReason`;
-      - propose A threshold from data (user sign-off), then POST /settings.
-- [ ] Extend to overnight if the 3h window looks healthy.
+## Long-term reliability verification — DONE (analysis 2026-10-15)
+- [x] Monitor ran 2026-10-14 13:30→16:30 (A's logcat kept capturing to
+      00:11 the next day — overnight window effectively covered):
+      `/tmp/opencode/mw-verify/` — `status.csv` (1035 rows), `logcat-A.log`
+      (3505 cycles), `logcat-B.log` (6187 cycles), per-cycle `diff=` truth.
+- [x] Analysis (per-cycle diff distributions, time-split busy/quiet, state
+      transitions, keyguard):
+  - **A stayed AWAKE the entire 3h window (517/517 rows, zero sleep cycles).**
+    Root cause: thr 0.6 is *below A's own noise peak*. Split by activity:
+    - A quiet (15:00→00:11, no one present, n=2762): p50 0.53, p90 0.90,
+      p95 1.11, **p99 2.10**; ≥2.0 in 0.9% of cycles; one 15.3 outlier.
+    - A busy (13:30–15:00, people present, n=743): p90 2.99; **34% of
+      cycles ≥2.0**, 10% ≥3.0, max 3.7.
+    - → at thr 0.6, **34% of QUIET cycles cross** (946/2762) → false
+      detections keep resetting idle → A never reaches the 10-min idle
+      sleep. This is the "screen won't turn off / seems unreliable"
+      complaint. (A is awake for legit reasons during 13:30–15:00 too —
+      real people.)
+  - Crossing rates on A's quiet profile (9h): ≥1.0 → 6.9%, ≥2.0 → 1.1%,
+    **≥2.5 → 0.5%** (14 cycles in 9h, scattered; CONFIRM_CYCLES=2 rejects
+    the isolated ones), ≥3.0 → 0.2%.
+  - **B (thr 3.0): 26 wake/sleep cycles, all short (20–100 s).** B's scene
+    is noisier (quiet p95 2.66, p99 4.56 — sustained tail, likely a live
+    TV/reflections in view); 3.0 sits just above B's quiet p95, reasonable;
+    wakes plausibly real. Recheck by eye / adjust if false.
+  - **Keyguard regression confirmed in-window**: B `showing=true` in all
+    517 rows (old bug); A clean. Fixed in shipped builds (dismiss chain on
+    every wake + boot), re-verified across reboots of 2.5/2.6 deploys.
+- [ ] **PROPOSED A threshold: 2.5** (user sign-off, then `POST /settings
+      {"threshold": 2.5}`). Rationale: +19% headroom over A quiet p99
+      (2.10), ~8% below the person floor (2.3) — false-wake crossings drop
+      from 34% of cycles (at 0.6) to 0.5%, while every person crossing
+      (2.3–3.7, many consecutive cycles) still detects. Alternatives if
+      still unsatisfied: 2.2 more sensitive (1.4%) / 2.8 more conservative
+      (0.4%). B stays 3.0.
+- [x] Overnight extension: A's capture ran to 00:11 next day with the same
+      quiet profile — no separate overnight run needed.
 
 ## Tablet B — bring-up (done)
 - [x] Install + device admin + home activity + keyguard (deploy.sh)
@@ -84,15 +109,15 @@ Root cause (empirical, this Fire build):
 - [x] B monitor is running (`running:true`), threshold 3.0, check 4s
 - [ ] Decide B's dashboard view (currently same `fire-6` view as A)
 
-## Tablet A — tuning (blocked on geometry + user decision)
-- [ ] Confirm physical orientation: what does A's camera see now?
-      (This morning it saw B; after rearrangement mostly static background.)
-- [ ] Choose final motion threshold: A is `0.6` — first long-monitor
-      minutes show detections at diff 3.2 while B stays at 1.3–1.8;
-      measure real-motion vs quiet noise from `logcat-A.log`, then
-      `POST /settings {"threshold": N}` (suggestion pending data).
-- [ ] Re-run full E2E: idle 10 min → screen dark; motion → wake +
-      dashboard reload — on both tablets.
+## Tablet A — tuning (blocked on user sign-off)
+- [x] Confirm physical orientation: A saw the busy period (13:30–15:00,
+      people crossing, diffs to 3.7) then a calm ~9h night — view is good.
+- [ ] Choose final motion threshold: **proposed 2.5** (data: A quiet p99
+      2.10, person floor 2.3 — see Long-term verification section).
+      On sign-off: `POST /settings {"threshold": 2.5}` to 192.168.48.187.
+- [ ] Re-run E2E after the threshold change: idle ≥10 min → sleep (no false
+      wakes over an evening), real motion → wake + dashboard reload. B is
+      already exercising this (26 wake/sleep cycles during the monitor).
 
 ## HA login (done for A, do for B if B is a wall)
 - [x] A: logged in as `fire-1`, wall dashboard (Fire-6 view) renders.
@@ -102,23 +127,60 @@ Root cause (empirical, this Fire build):
       after HA-wake at 17:11 — verify `fire-6` view renders on B; if B's
       session isn't logged in, do the same adb login steps as A).
 
-## OTA update — user request 2026-10-15 (NOT STARTED)
-Goal: ship a new app build to A/B over the LAN, no USB.
-- [ ] App: `POST /update` (APK body + token) → PackageInstaller
-      self-install (double-commit pattern: commit(installIntent) →
-      UpdateInstaller activity → commit(commitIntent)), then
-      MY_PACKAGE_REPLACED revives the service (BootStarter path).
-      Vendored jar already has full PackageInstaller
-      (openSession/openWrite/fseal/commit(IntentSender)/abandon;
-      NOTE jar MODE_FULL_INSTALL=1 — verify vs runtime).
-- [ ] App: `GET /update/status` (version, last commit ts/result,
-      session state), ACTION_COMMIT receiver / INITIALIZATION_COMPLETE.
-- [ ] `scripts/ota-update.sh`: build if stale, POST /update to each
-      tablet (A 192.168.48.187 / B 192.168.48.36 + tokens), poll
-      /health → /status for the new versionName.
-- [ ] Test on B first (identical-signature release→release update;
-      debug→release needs uninstall+install fallback path?).
-- [ ] Later: HA `button.*update` entity calling the same endpoint.
+## OTA update — DONE (2026-10-15, v2.6/code 17 on A & B, verified over LAN)
+Goal: ship a new build to A/B over the LAN, no USB. ✅ Shipped.
+
+### Mechanism (final)
+- **PRIMARY = host-driven `adb install -r` (streamed, shell uid) over adbd
+  TCP 5555.** `scripts/ota-update.sh <A|B|ip>`: ensures the TCP transport
+  (auto re-enables it via `adb -s <usb-serial> tcpip 5555` after a reboot),
+  installs, polls `/status` until the new `version` is reported.
+- **In-app `POST /update` channels** (for permissive builds / future), order:
+  `pm install -r` of a pre-created 666 file under `/data/local/tmp` → PIS
+  double-commit (PisBridge) → pm session create/write/commit →
+  multi-location `pm install -r <path>`.
+- UpdateDoneReceiver stamps `/update/status` applied on
+  SESSION_COMMITTED / INITIALIZATION_COMPLETE, and (new) on
+  MY_PACKAGE_REPLACED when an in-app attempt is pending — this is what
+  closes host-driven installs (they don't fire INITIALIZATION_COMPLETE).
+
+### Fire-build gotchas (empirical, 2026-10-15)
+- PIS client side dead here: `getSystemService("package_installer")` null;
+  `IPackageInstaller` stripped to `uninstall` only (classic Java API unusable).
+- pm session cmds from app uid: `install-create` OK (needs `--user 0`;
+  missing `-i com.egraf.motionwake` → NPE in AppOpsService);
+  `install-write` stdin → "Reverse mode only supported from shell or system";
+  PATH → server opens the file → file-context broker.
+- **File-context broker is caller-aware:** app_data_file, media_rw_data_file
+  AND shell_data_file all rejected for app-uid callers; shell uid passes.
+  (Amazon `fileSystem` service + AOSP PackageManagerShellCommand#setParamsSize.)
+- SELinux: `appdomain→shell_data_file (write getattr)`,
+  `untrusted_app_all→(open read …)`, `neverallow app create` → the app may
+  truncate+write an EXISTING 666 file in /data/local/tmp but not create one
+  (deploy.sh pre-creates it).
+- `service.adb.tcp.port` is NOT persistent and only shell/adbd domains can
+  set it → after every reboot a host must run `adb tcpip 5555` over any live
+  transport (USB); `/status` now reports this as `"adb_tcp":"5555"|""` for
+  monitoring. Nothing on-device in our app's uid can set it (shell_prop).
+- `adb install -r` (reinstall) accepts equal/lower versionCode only with `-d`;
+  we bump per OTA step as a marker anyway.
+
+### Verification (2026-10-15)
+- B (192.168.48.36): 12→13→14→15→16→17 over the session; rebooted
+  mid-session (clean boot: service, a11y, dashboard intact; TCP mode dropped
+  as expected, ota-update.sh auto re-enabled via USB and the OTA succeeded).
+- A (192.168.48.187): 1 → 15 (USB bootstrap) → 16 → 17 over the LAN.
+- Both end on 2.6/17: monitor running, a11y bound, admin active,
+  keyguard dismissed, `adb_tcp":"5555"`, `/update/status` stamped
+  `applied` after B's host-driven install (new receiver logic ✓).
+- Code: 98fd304 (main, pushed).
+
+### Follow-ups
+- [ ] HA `button.mw_*_ota` entity: host runs `scripts/ota-update.sh`
+      (HA holds the APK; trigger = HA → webhook/cron → script).
+- [ ] Nice-to-have: app self-heals adbd-TCP after reboots (speak ADB
+      protocol to its own adbd over 127.0.0.1:5555 with a staged host RSA
+      key) — removes the one post-reboot USB touch.
 
 ## Housekeeping
 - [ ] README: document the two device quirks + deploy.sh keyguard swipe
