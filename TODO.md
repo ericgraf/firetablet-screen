@@ -95,7 +95,7 @@ Root cause (empirical, this Fire build):
       (2.10), ~8% below the person floor (2.3) — false-wake crossings drop
       from 34% of cycles (at 0.6) to 0.5%, while every person crossing
       (2.3–3.7, many consecutive cycles) still detects. Alternatives if
-      still unsatisfied: 2.2 more sensitive (1.4%) / 2.8 more conservative
+      still unsatisfied: 2.2 more sensitive (0.8%) / 2.8 more conservative
       (0.4%). B stays 3.0.
 - [x] Overnight extension: A's capture ran to 00:11 next day with the same
       quiet profile — no separate overnight run needed.
@@ -112,9 +112,13 @@ Root cause (empirical, this Fire build):
 ## Tablet A — tuning (blocked on user sign-off)
 - [x] Confirm physical orientation: A saw the busy period (13:30–15:00,
       people crossing, diffs to 3.7) then a calm ~9h night — view is good.
-- [ ] Choose final motion threshold: **proposed 2.5** (data: A quiet p99
-      2.10, person floor 2.3 — see Long-term verification section).
-      On sign-off: `POST /settings {"threshold": 2.5}` to 192.168.48.187.
+- [x] **A threshold = 2.5 — SIGNED OFF + APPLIED 2026-10-15** (data: A quiet
+      p99 2.10, person floor 2.3 — see Long-term verification section).
+      Applied via `POST /settings {"threshold": 2.5}`; `/status` confirms
+      `threshold:2.5`. Expected: A now actually reaches its 10-min idle
+      sleep (was awake 100% of the 3h window at 0.6), spurious wakes drop
+      34%→0.5% of cycles. Watch one evening; fallbacks if needed:
+      2.2 (1.4% cross) / 2.8 (0.4% cross). B stays 3.0.
 - [ ] Re-run E2E after the threshold change: idle ≥10 min → sleep (no false
       wakes over an evening), real motion → wake + dashboard reload. B is
       already exercising this (26 wake/sleep cycles during the monitor).

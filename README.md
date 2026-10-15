@@ -18,7 +18,9 @@ app/                    Android app (com.egraf.motionwake)
 scripts/
   setup.sh              one-time provisioning (SDK, licenses, keystore)
   build.sh              ./gradlew assembleDebug + assembleRelease
-  deploy.sh             adb install + control commands (USB or host:port)
+  deploy.sh             USB deploy: install, perms, admin, a11y, keyguard,
+                        OTA staging slot, LAN adb transport
+  ota-update.sh         LAN OTA (adb over TCP 5555 + in-app /update fallback)
 config/                 signing keystore + properties (generated)
 ```
 
@@ -67,6 +69,57 @@ androidx.core 1.13.1 (only library dependency).
    adb shell am start-foreground-service -n com.egraf.motionwake/.MotionWakeService
    ```
 
+## OTA updates over the LAN (no USB for the install)
+
+```sh
+./scripts/ota-update.sh            # both known tablets (A + B)
+./scripts/ota-update.sh B          # one of them (by name or IP)
+```
+
+Mechanism (empirical result on this Fire build): the *host* runs a streamed
+`adb install -r` over adbd's TCP transport (port 5555) — a **shell-uid**
+install, the only caller the PMS file-context broker here accepts (it
+rejects file installs issued by the app's own uid, and the Java
+PackageInstaller client interface is stripped on this build). `deploy.sh`
+enables the TCP transport once; `service.adb.tcp.port` is **not
+persistent**, so after the tablet reboots `ota-update.sh` re-enables it
+over the still-plugged USB transport (needs USB at that moment). If no
+ADB transport is available at all, the script falls back to the app's own
+`POST /update` channels (pm install of a staged file in the pre-created
+`/data/local/tmp` slot → PackageInstaller double-commit → pm session
+create/write/commit → multi-location `pm install -r`), which work on more
+permissive builds. After any install, `MY_PACKAGE_REPLACED` → BootStarter
+revives the service, and `GET /update/status` is stamped `applied`
+(pending-attempt + MY_PACKAGE_REPLACED close it; INITIALIZATION_COMPLETE
+and SESSION_COMMITTED cover the in-app paths). `GET /status` reports
+`"adb_tcp":"5555"|"", which monitoring can use to notice a transport
+that dropped after a reboot.
+
+Versioning: bump `versionCode`/`versionName` in `app/build.gradle` for
+each release (reinstall accepts ≥ current; downgrades need `-d`).
+
+## Keyguard (TV-style) dismissal — required on this build
+
+The keyguard window belongs to uid 1000; our app uid is denied BOTH MOTION
+and generic-key injection into it, and `requestDismissKeyguard()` is gated
+behind an Amazon signature permission. What works: our own
+`AccessibilityService` (`MwA11y`) — the a11y framework dispatches the
+swipe with a trusted uid, so a `dispatchGesture` **swipe-up** dismisses it
+(`performGlobalAction(BACK)` alone does NOT dismiss this TV-style
+keyguard). `deploy.sh` enables the service once
+(`settings put secure enabled_accessibility_services`), and the app
+**re-dismisses on every wake and on boot** — the keyguard reappears after
+every timeout sleep, and while it is showing it pins the display's
+screen-off timeout to 10 s.
+
+## Camera self-heal (Fire's idle-UID camera policy)
+
+Fire restricts camera access for UIDs it considers "idle" (screen off +
+no visible activity — exactly our state while asleep). When a check sees
+the camera "disabled by policy", the app brings our own dashboard activity
+briefly to the front so the UID has a visible activity again, then
+continues (log: `self-heal: bringing dashboard to front`).
+
 ## Controlling it
 
 | Action          | Command (adb shell)                                                                                        |
@@ -114,6 +167,9 @@ adb forward tcp:8587 tcp:8587 && curl -s -H "X-MotionWake-Token: $TOK" http://12
 | `/browser`         | GET    | current dashboard URL                                              |
 | `/browser`         | POST   | set + open a dashboard URL: `{"url":"http://ha.local:8123/lovelace/wall"}` |
 | `/browser/reload`  | POST   | reload the stored dashboard URL in the kiosk browser              |
+| `/update`          | POST   | self-install a new APK (raw APK body). Channels: staged pm install\n→ PackageInstaller → pm session → multi-location pm (see **OTA** section; on this build the host-side `adb install` via\n`scripts/ota-update.sh` is the proven path) |
+| `/update/status`   | GET    | OTA state: `version`, `state` (`none`/`pending`/`applied`),\n`attempt_ts`/`applied_ts`, `last_result` |
+| `/update/diag`     | GET    | install-channel diagnostics (PIS surface, staged file, pm output) |
 
 Response shape is `{"ok":true, ...}` (HTTP 200); `{"ok":false,"error":...}`
 on 400/401/404/405/413. Example — put the wall tablet to sleep from Home
@@ -162,10 +218,14 @@ absolute difference ≥ `threshold` on 2 consecutive checks (the first 2
 checks after start are warm-up and discarded while exposure settles).
 Checking 2–30 s apart is actually *better* for detection than frame-by-frame
 diffing — a scene change has more time to develop, and the static-scene
-noise floor is tiny (a handless room measures ~0.1–0.3 against the 3.0
-default, so there's plenty of headroom). Failed checks (camera held by
-another app, timeouts) pace in with a 2 s → 15 s backoff and are skipped —
-they never produce a false motion event.
+noise floor is scene-dependent — MEASURE before choosing `threshold`:
+log every cycle (`cycle N diff=X.XX thr=...`) with no one around, and pick
+a threshold at least ~20% above that scene's p99 while staying below the
+diffs real movement produces (our wall tablet measured p50 ≈0.5, p99
+≈2.1 quiet vs 2.3–3.7+ for people → threshold 2.5). A handless test-room
+scene measures ~0.1–0.3. Failed checks (camera held by another app,
+timeouts) pace in with a 2 s → 15 s backoff and are skipped — they never
+produce a false motion event.
 
 `dumpsys media.camera` shows the camera disconnected between checks, which
 is the power-saver property to verify.
