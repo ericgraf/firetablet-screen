@@ -94,8 +94,8 @@ adb -s "$SERIAL" shell dpm set-active-admin --user 0 "$PKG/.MwDeviceAdmin" 2>/de
 adb -s "$SERIAL" shell cmd package set-home-activity --user 0 "$PKG/.DashboardBrowser" 2>/dev/null || true
 # Nova-launcher wrapper (last-used app relaunched by Amazon's Eve at boot):
 # disable it so it can't cover the dashboard home. Re-enable with:
-#   adb shell pm enable com.baronkiko.launcherhijacl
-adb -s "$SERIAL" shell pm disable-user --user 0 com.baronkiko.launcherhijacl 2>/dev/null || true
+#   adb shell pm enable com.baronkiko.launcherhijack
+adb -s "$SERIAL" shell pm disable-user --user 0 com.baronkiko.launcherhijack 2>/dev/null || true
 
 echo "==> Enabling the dismiss accessibility service"
 # MotionWake's a11y service (MwA11y) is the primary keyguard-dismiss channel:

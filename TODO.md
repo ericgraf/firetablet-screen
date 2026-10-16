@@ -1,6 +1,91 @@
 # MotionWake TODO
 
-## Keyguard dismissal — DONE (2026-10-15, verified on A & B)
+## Fleet status (as of 2026-10-16)
+
+| Tablet | Serial | IP | App | threshold | check | idle | Dashboard |
+|--------|--------|----|-----|-----------|-------|------|-----------|
+| A (Fire-1) | `GN41XE033142076C` | 192.168.48.187 | 2.6/17 | **1.3** | 6 s | 10 min | `http://silver:8123/wall-tablets/fire-6` (as `fire-1`) |
+| B (Fire-2) | `GN41XE03314207GG` | 192.168.48.36 | 2.6/17 | **1.2** | 4 s | 10 min | `http://silver:8123/wall-tablets/fire-6` (as `fire-1`) |
+| C (Fire-3) | `GN41XE03314205D3` | 192.168.50.175 | 2.6/17 | **4.0** | 2 s | 10 min | `http://silver:8123/wall-tablets/fire-3` (as `fire-3`) |
+
+API tokens: A `2323353392f614aaeef9507762f742be`; B `af9207f2943857162fcc9f2ec7ebbbb3`;
+C `c98e7ec38a852a3fac43ec6f81a03e3f`.
+HA: all three config entries live (C entry_id `G4EUGVQJJU93U8SDKTRCMAD6C5`,
+unique_id `192.168.50.175:8587`). HA local user for C: `fire-3` / `firewall3`
+(asked user to change the password later in HA).
+
+## Tablet C (Fire-3) — onboarded DONE (2026-10-16)
+- [x] Kiosk identified (Fully kiosk `de.ozerov.fully` + `com.baronkiko.launcherhijack`,
+      showing the HA `fire-3` view) and BOTH fully uninstalled
+      (`pm uninstall -k --user 0`). Active admins now: only
+      `com.amazon.parentalcontrols` (profile owner, nominal) +
+      `com.egraf.motionwake/.MwDeviceAdmin`.
+- [x] `./scripts/deploy.sh GN41XE03314205D3` (over USB): v2.6/17, OTA slot,
+      LAN adb 192.168.50.175:5555, perms, MwDeviceAdmin, home=DashboardBrowser,
+      MwA11y, keyguard dismissed; clean reboot + boot chain verified.
+- [x] `pm grant CAMERA` needed explicitly on C; token generated,
+      restart-persistence proven (force-stop + reviver broadcast).
+- [x] HA: config entry added for C + HA restarted; 6 entities registered.
+- [x] HA login on C (adb UI automation): username (621,338) / password
+      (621,450) / login (621,604) in 1280x800 landscape; TAB/ENTER over
+      BACK; `fire-3` logged in, dashboard renders (sidebar + Fire-1/2/3 views).
+- [x] Calibration (capture in /tmp/opencode/calC-raw.txt): absent/standstill
+      0.6–2.7, person moves 10–53 (peak 53.77) → **threshold 4.0, check 2 s**
+      (live via POST /settings; worst-case wake latency ~6.6 s).
+- [x] C quirks logged: explicit `pm grant CAMERA`; `wm size` 800x1280 but
+      screencap PNG is 1280x800 (input coords = bitmap space); uiautomator
+      mostly "null root node"; shell "Permission denied" on
+      `/data/data/<pkg>/`.
+
+## v2.7 build (code 18) — AWAITING USER GO (2026-10-16)
+- [ ] **AlarmManager watchdog for A's dead-process incident:** 2026-10-16
+      ~10:34 a gms crash-loop killed A's motionwake service; START_STICKY
+      restarted once but was lost (A's RAM ~1.76/1.86 GB used — low-memory
+      killer territory). Build 2.7: schedule an AlarmManager exact-ish
+      wake/heartbeat that re-asserts the foreground service when it's dead
+      (the app can't survive its own process death otherwise).
+- [ ] **`confirm_cycles` runtime setting:** motion gate is currently the
+      compile-time `CONFIRM_CYCLES = 2` (MotionCameraManager L65). Expose as
+      a POST /settings key (1–5) + HA number entity so the 2-consecutive
+      crossing gate is tunable per tablet without a rebuild.
+- [ ] Note: user was concurrently experimenting in MotionCameraManager
+      (a `motionFlag` AtomicBoolean, an `if (threshold > 0.05f)` guard
+      around detection, a duplicated "Motion state: none -> ACTIVE" log
+      line); the working tree is back to clean @1b23325 (2026-10-16
+      evening) — revisit whether those changes are still wanted before
+      building 2.7.
+- Also proposed (needs GO): `auto_start` accepted by POST /settings
+  (currently read-only in the API) so the HA `auto_start` sensor can
+  become a real switch.
+
+## HA integration v2.0.0 — DONE (2026-10-16)
+- [x] Full configuration surface in Home Assistant (replaces
+      "can these values be updated over the air from HA?" — yes):
+      `number.*_{threshold,check_seconds,idle_minutes}` (applied live),
+      `text.*_dashboard_url` (sets + opens),
+      `button.*_{restart_service,update_app_ota}`,
+      `sensor.*_{idle_time_s,app_version,auto_start,adb_tcp,update_state}`,
+      + `motionwake.set_settings` service (entry_id + any fields).
+      See README "Home Assistant integration" section.
+- [x] E2E verified: `number.set_value` threshold 4.0→4.3 applied on C
+      (app `/settings` confirms 4.300000190734863), restored to 4.0 via
+      the `motionwake.set_settings` service; all 48 entities (16 × 3
+      tablets) in the state machine with live values.
+- [x] HA 2026.10.1 API fixes: `async_register_admin_service(hass, domain,
+      name, func, schema)`; `NumberEntity` native API; `TextEntity
+      .native_value` + `TextMode.TEXT`; no `BooleanSensor` (use Sensor
+      "on"/"off"); `CONF_ENTRY_ID` not in `homeassistant.const` (define in
+      const.py).
+- [x] HA REST gotcha (2026.x): service calls are
+      `POST /api/services/{domain}/{service}` (dot form 404s).
+      Bearer = HS256 JWT `{"iss": <refresh_token.id>}` signed with that
+      token's `jwt_key`.
+- [ ] OTA button wiring: set each entry's Options → *OTA source* to the
+      release APK (URL or /config path) — then `button.*_update_app_ota`
+      appears. (Alternative calvin-ssh `ota-update.sh` design still valid
+      as fallback.)
+
+## Keyguard dismissal — DONE (2026-10-15, verified on A & B & C)
 Root cause (empirical, this Fire build):
 - The keyguard window belongs to uid 1000; our app uid 10121 is denied
   BOTH MOTION and generic-KEY injection into it:
@@ -40,7 +125,10 @@ Root cause (empirical, this Fire build):
   platforms/android-35/android.jar (device uses 111) — use literal
   keycodes for dismiss keys.
 
-## HA integration on silver — DONE (2026-10-14)
+## HA integration on silver — DONE (2026-10-14; v2.0.0 full control 2026-10-16)
+- [x] v2.0.0 (2026-10-16): full configuration surface — see the
+      "HA integration v2.0.0" section above (numbers/text/buttons/sensors
+      + `motionwake.set_settings` service + OTA button), E2E tested.
 - [x] Installed in `/config/custom_components/motionwake`
       (copied from `/home/egraf/scripts/ha-motionwake`; HACS repo
       `ericgraf/ha-motionwake` available later for updates).
@@ -106,7 +194,8 @@ Root cause (empirical, this Fire build):
 - [x] Service auto-start on boot; API + API token working
 - [x] Keyguard regression root-caused + fixed (see section above)
 - [x] B on RELEASE build; keyguard dismissal survives reboots (2026-10-15)
-- [x] B monitor is running (`running:true`), threshold 3.0, check 4s
+- [x] B monitor is running (`running:true`), **threshold 1.2**, check 4s
+      (re-tuned 2026-10-16; was 3.0 during bring-up)
 - [ ] Decide B's dashboard view (currently same `fire-6` view as A)
 
 ## Tablet A — tuning (blocked on user sign-off)
@@ -127,6 +216,12 @@ Root cause (empirical, this Fire build):
       verified by screenshot. Motion→wake side covered by B's 26 real
       wake/sleep cycles during the monitor. One-evening watch still
       recommended before considering it fully settled.
+- [x] **A re-tuned to 1.3 / check 6 s (2026-10-16)** — current live value
+      (fallbacks if 1.3 misbehaves: 1.4 more conservative / 1.2 more
+      sensitive); B to 1.2 / 4 s. Both still need the one-evening watch.
+- [ ] A dead-process incident 2026-10-16 ~10:34 (gms crash-loop + low
+      RAM killed the service; START_STICKY restart lost once) →
+      watchdog in v2.7 (see v2.7 section above).
 
 ## HA login (done for A, do for B if B is a wall)
 - [x] A: logged in as `fire-1`, wall dashboard (Fire-6 view) renders.
@@ -189,15 +284,12 @@ Goal: ship a new build to A/B over the LAN, no USB. ✅ Shipped.
 - Code: 98fd304 (main, pushed).
 
 ### Follow-ups
-- [ ] HA `button.mw_*_ota` entity — FEASIBILITY CONFIRMED (2026-10-15):
-      calvin (192.168.50.97, same /20 as the tablets) is the OTA
-      controller (repo + adb + APK + authorized keys); HA container has
-      `ssh`+`curl` (Alpine). Design: HA integration exposes
-      `button.mw_<x>_ota` → `shell_command` domain:
-      `ssh calvin 'cd /home/egraf/scripts/firetablet-app &&
-      ./scripts/ota-update.sh <A|B>'` (HA→calvin key setup + a shell
-      command config per tablet, script logs to a file HA can tail).
-      Fallback if ssh keying is fiddly: tiny HTTP trigger on calvin.
+- [x] HA OTA button — DONE via the in-app channel (2026-10-16): integration
+      v2.0.0 `button.*_update_app_ota` fetches the APK from the entry's
+      Options→*OTA source* (URL or /config file path) and POSTs the bytes to
+      the tablet's `/update` (app stages + installs + restarts; progress in
+      `sensor.*_update_state`). The calvin-ssh `ota-update.sh` design below
+      remains as an alternative (still used for host-driven installs).
 - [ ] Nice-to-have: app self-heals adbd-TCP after reboots (speak ADB
       protocol to its own adbd over 127.0.0.1:5555 with a staged host RSA
       key) — removes the one post-reboot USB touch.
@@ -209,5 +301,9 @@ Goal: ship a new build to A/B over the LAN, no USB. ✅ Shipped.
       Camera self-heal, OTA updates over LAN; threshold-tuning guidance).
 - [x] Re-verify keyguard dismissal on EVERY wake + boot, not one-time
       (KEYGUARD section above)
+- [x] `scripts/deploy.sh` launcher package name typo fixed:
+      `launcherhijacl` → `launcherhijack` (2026-10-16)
+- [x] README fleet table (A/B/C profiles + final thresholds) + HA 2.0.0
+      integration section (2026-10-16)
 - [ ] HACS repo: tag new version once behavior/docs change
-      (currently v1.0.0 @ 165a0c8; new commits on main)
+      (app currently 2.6/17 @ main; HA integration v2.0.0 untagged)

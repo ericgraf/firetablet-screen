@@ -185,6 +185,50 @@ curl -s -X POST -H "X-MotionWake-Token: $TOK" $BASE/sleep
 `idle_limit_ms`, `last_motion_age_ms`, `idle_minutes`, `threshold`,
 `check_seconds`, `port`, `version`.
 
+## Home Assistant integration (custom component, v2.0.0, 2026-10-16)
+
+Source: `/home/egraf/scripts/ha-motionwake` (calvin); live on silver at
+`/config/custom_components/motionwake` (`rsync` + `docker restart
+homeassistant`, ~10 s). One config entry per tablet (host/port/token).
+HA 2026.x verified — entity surface per tablet:
+
+| Domain | Entity | Maps to |
+|--------|--------|---------|
+| `switch`   | `motion_monitoring` | POST `start`/`stop` (existing) |
+| `button`   | `wake_display`, `sleep_display`, `reload_dashboard` | POST `/wake`, `/sleep`, `/browser/reload` |
+| `button`   | `restart_service` | POST `/shutdown` (BootStarter restarts it) |
+| `button`   | `update_app_ota` *(only when an OTA source is set)* | fetch APK → POST `/update` → app self-installs |
+| `number`   | `threshold` (0.5–15, step .1), `check_seconds` (2–30), `idle_minutes` (1–1440) | POST `/settings` — **applied live** on the tablet |
+| `text`     | `dashboard_url` | POST `/browser` — re-points the tablet + opens the URL |
+| `sensor`   | `screen_state`, `last_motion_s`, `idle_time_s` | GET `/status` (existing + new) |
+| `sensor`   | `app_version`, `auto_start`, `adb_tcp`, `update_state` | GET `/status` + `/settings` + `/update/status` (new) |
+
+Also registers the admin service `motionwake.set_settings`
+(`entry_id` + any of `threshold` / `check_seconds` / `idle_minutes` /
+`dashboard_url`) for bulk/automation use:
+
+```yaml
+script:
+  tune_tablet_c:
+    sequence:
+      - service: motionwake.set_settings
+        data: {entry_id: <config-entry-id>, threshold: 4.0, check_seconds: 2}
+```
+
+OTA button setup: integration → **Options** → *OTA source (optional)* —
+either an `http(s)://` URL that serves the release APK, or a file path
+visible inside the HA container (e.g. `/config/motionwake-update.apk`).
+Pressing `update_app_ota` fetches the APK, POSTs the bytes to the
+tablet's `/update`, and the app installs + restarts; progress is visible
+in `sensor.*_update_state`.
+
+HA-side gotchas (2026.x): services are registered with
+`helpers.service.async_register_admin_service`; number/text use the
+`native_value` APIs; REST service calls are
+`POST /api/services/{domain}/{service}` (slash, not dot); TextEntity
+regex global flags must be at position 0 (`(?i)^...` raises
+`re.PatternError` — use `^[a-z]...` or `(?i)^...` at position 0).
+
 ## Kiosk dashboard + boot behaviour
 
 - `DashboardBrowser` is a kiosk WebView that renders the dashboard URL
@@ -221,11 +265,15 @@ diffing — a scene change has more time to develop, and the static-scene
 noise floor is scene-dependent — MEASURE before choosing `threshold`:
 log every cycle (`cycle N diff=X.XX thr=...`) with no one around, and pick
 a threshold at least ~20% above that scene's p99 while staying below the
-diffs real movement produces (our wall tablet measured p50 ≈0.5, p99
-≈2.1 quiet vs 2.3–3.7+ for people → threshold 2.5). A handless test-room
-scene measures ~0.1–0.3. Failed checks (camera held by another app,
-timeouts) pace in with a 2 s → 15 s backoff and are skipped — they never
-produce a false motion event.
+diffs real movement produces. Our fleet measured 2026-10-16:
+| Tablet | Scene profile | threshold | check |
+|--------|---------------|-----------|-------|
+| A (192.168.48.187) | quiet p99 ≈2.1, people 2.3–3.7+ | **1.3** | 6 s |
+| B (192.168.48.36)  | noisier scene (live TV/reflections) | **1.2** | 4 s |
+| C Fire-3 (192.168.50.175) | absent/standstill 0.6–2.7, person moves 10–53 | **4.0** | 2 s |
+A handless test-room scene measures ~0.1–0.3. Failed checks (camera held by
+another app, timeouts) pace in with a 2 s → 15 s backoff and are skipped —
+they never produce a false motion event.
 
 `dumpsys media.camera` shows the camera disconnected between checks, which
 is the power-saver property to verify.
