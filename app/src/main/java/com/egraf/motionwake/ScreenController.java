@@ -245,14 +245,14 @@ final class ScreenController {
      * keyguard while up pins the display's screen-off timeout to 10 s.
      *
      * Strategies (this build, in order):
-     *   1. AmazonKeyguardService transaction 5 via 'service call' —
+     *   1. Our AccessibilityService (MwA11y) swipe-up gesture — the channel
+     *      proven on the fleet ("keyguard dismissed via a11y swipe gesture"
+     *      on A/B live logs); tried first so the wake path doesn't burn its
+     *      budget on weaker probes, then GLOBAL_ACTION_BACK.
+     *   2. AmazonKeyguardService transaction 5 via 'service call' —
      *      Amazon's internal keyguard binder (dismiss works from shell uid;
      *      from our app uid the service currently rejects the pid — kept as
      *      a cheap probe in case the allowlist widens).
-     *   2. Our AccessibilityService (MwA11y): GLOBAL_ACTION_BACK, then the
-     *      proven swipe-up gesture — dispatched by the a11y framework
-     *      itself (trusted path, no INJECT_EVENTS/uid checks). The channel
-     *      of choice when the app's own uid is not dispatch-trusted.
      *   3. KEYCODE_BACK through the KeyInjector null-focus KEY path.
      *   4. MOTION swipe-up (KeyguardSwipe) — needs the dispatcher to accept
      *      our uid for the topmost window (INJECT_EVENTS territory).
@@ -263,21 +263,23 @@ final class ScreenController {
             Log.i(TAG, "keyguard dismiss: not showing — no-op");
             return true;
         }
-        if (KeyguardSwipe.dismissViaAmazonService(mApp)) {
-            Log.i(TAG, "keyguard dismissed via AmazonKeyguardService");
-            return true;
-        }
         if (MwA11y.available()) {
+            // The proven fleet channel first (A/B live logs: "a11y swipe
+            // gesture"); only then the cheap-but-unreliable probes.
+            if (MwA11y.swipeUp(mApp) && waitForKeyguardGone(2500L)) {
+                Log.i(TAG, "keyguard dismissed via a11y swipe gesture");
+                return true;
+            }
             MwA11y.globalBack();
             if (waitForKeyguardGone(1500L)) {
                 Log.i(TAG, "keyguard dismissed via a11y GLOBAL_ACTION_BACK");
                 return true;
             }
-            if (MwA11y.swipeUp(mApp) && waitForKeyguardGone(2500L)) {
-                Log.i(TAG, "keyguard dismissed via a11y swipe gesture");
-                return true;
-            }
-            Log.i(TAG, "a11y back+swipe did not dismiss — next strategy");
+            Log.i(TAG, "a11y swipe+back did not dismiss — next strategy");
+        }
+        if (KeyguardSwipe.dismissViaAmazonService(mApp)) {
+            Log.i(TAG, "keyguard dismissed via AmazonKeyguardService");
+            return true;
         }
         if (dismissKeyguardByKey()) {
             return true;

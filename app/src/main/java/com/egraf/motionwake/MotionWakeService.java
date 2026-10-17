@@ -6,6 +6,7 @@
 package com.egraf.motionwake;
 
 import android.Manifest;
+import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -39,7 +40,10 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     public static final String PREF_THRESHOLD = "threshold";
     public static final String PREF_CHECK_SECONDS = "check_seconds";
     public static final String PREF_AUTO_START = "auto_start";
+    public static final String PREF_CONFIRM_CYCLES = "confirm_cycles";
     public static final String PREF_API_TOKEN = "api_token";
+    public static final String PREF_WATCHDOG_ARMED = "watchdog_armed";
+    public static final String PREF_HEARTBEAT_TS = "heartbeat_ts";
     public static final String PREF_OTA_ATTEMPT_TS = "ota_attempt_ts";
     public static final String PREF_OTA_APPLIED_TS = "ota_applied_ts";
     public static final String PREF_OTA_LAST_RESULT = "ota_last_result";
@@ -51,11 +55,19 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     public static final long DEFAULT_CHECK_SECONDS = 4L;
     public static final long MIN_CHECK_SECONDS = 2L;
     public static final long MAX_CHECK_SECONDS = 30L;
+    public static final int DEFAULT_CONFIRM_CYCLES = 2;
+    public static final int MIN_CONFIRM_CYCLES = 1;
+    public static final int MAX_CONFIRM_CYCLES = 5;
+    /** Watchdog revives the service if its heartbeat is older than this. */
+    public static final long WATCHDOG_STALE_MS = 90L * 1000L;
+    /** Watchdog alarm period (inexact). */
+    public static final long WATCHDOG_PERIOD_MS = 30L * 1000L;
 
     public static final String ACTION_START = "com.egraf.motionwake.action.START_SERVICE";
     public static final String ACTION_STOP = "com.egraf.motionwake.action.STOP_SERVICE";
     public static final String ACTION_WAKE = "com.egraf.motionwake.action.WAKE";
     public static final String ACTION_SLEEP = "com.egraf.motionwake.action.SLEEP";
+    public static final String ACTION_WATCHDOG = "com.egraf.motionwake.action.WATCHDOG";
 
     /** For the UI: whether the monitor loop is active. */
     public static volatile boolean sRunning = false;
@@ -77,6 +89,8 @@ public final class MotionWakeService extends Service implements MotionCameraMana
     private ApiServer mApi;
     private volatile boolean mForegroundStarted;
 
+    private long mLastHeartbeat = 0L;
+
     private final Runnable mTickRunnable = new Runnable() {
         @Override
         public void run() {
@@ -84,6 +98,13 @@ public final class MotionWakeService extends Service implements MotionCameraMana
                 return;
             }
             tickOnce();
+            if (mPrefs != null) {
+                long now = SystemClock.elapsedRealtime();
+                if (now - mLastHeartbeat >= 5000L) {
+                    mLastHeartbeat = now;
+                    mPrefs.edit().putLong(PREF_HEARTBEAT_TS, now).apply();
+                }
+            }
             if (mTick != null) {
                 mTick.postDelayed(this, 1000L);
             }
@@ -118,6 +139,9 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         }
         if (!mPrefs.contains(PREF_AUTO_START)) {
             editor.putBoolean(PREF_AUTO_START, true);
+        }
+        if (!mPrefs.contains(PREF_CONFIRM_CYCLES)) {
+            editor.putInt(PREF_CONFIRM_CYCLES, DEFAULT_CONFIRM_CYCLES);
         }
         editor.commit();
 
@@ -271,6 +295,10 @@ public final class MotionWakeService extends Service implements MotionCameraMana
                             if (mCamera != null) {
                                 mCamera.setIntervalMs(checkSecondsFromPrefs(prefs) * 1000L);
                             }
+                        } else if (PREF_CONFIRM_CYCLES.equals(key)) {
+                            if (mCamera != null) {
+                                mCamera.setConfirmCycles(confirmCyclesFromPrefs(prefs));
+                            }
                         }
                     }
                 };
@@ -282,6 +310,7 @@ public final class MotionWakeService extends Service implements MotionCameraMana
             mCamera.setThreshold(clamp(mPrefs.getFloat(PREF_THRESHOLD, DEFAULT_THRESHOLD),
                     MIN_THRESHOLD, MAX_THRESHOLD));
             mCamera.setIntervalMs(checkSecondsFromPrefs(mPrefs) * 1000L);
+            mCamera.setConfirmCycles(confirmCyclesFromPrefs(mPrefs));
             mCamera.start();
         }
         if (mTick == null) {
@@ -289,8 +318,10 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         }
         mTick.post(mTickRunnable);
         sRunning = true;
+        armWatchdog();
         Log.i(TAG, "monitor started (idle=" + (mIdleMs / 60000) + "min, threshold="
-                + mCamera.getThreshold() + ", check=" + mCamera.getIntervalMs() / 1000 + "s)");
+                + mCamera.getThreshold() + ", check=" + mCamera.getIntervalMs() / 1000 + "s"
+                + ", confirm=" + mCamera.getConfirmCycles() + ")");
     }
 
     private void stopMonitoring() {
@@ -313,6 +344,7 @@ public final class MotionWakeService extends Service implements MotionCameraMana
             mPrefs.unregisterOnSharedPreferenceChangeListener(mPrefListener);
             mPrefListener = null;
         }
+        disarmWatchdog();
         sRunning = false;
     }
 
@@ -330,6 +362,63 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         long seconds = prefs.getLong(PREF_CHECK_SECONDS, DEFAULT_CHECK_SECONDS);
         seconds = Math.max(MIN_CHECK_SECONDS, Math.min(seconds, MAX_CHECK_SECONDS));
         return seconds;
+    }
+
+    static int confirmCyclesFromPrefs(SharedPreferences prefs) {
+        int n = prefs.getInt(PREF_CONFIRM_CYCLES, DEFAULT_CONFIRM_CYCLES);
+        return Math.max(MIN_CONFIRM_CYCLES, Math.min(MAX_CONFIRM_CYCLES, n));
+    }
+
+    // --- Watchdog: self-revive if the process dies while monitoring -------
+    //
+    // A repeating inexact AlarmManager alarm fires every WATCHDOG_PERIOD_MS.
+    // While monitoring, the service stamps PREF_HEARTBEAT_TS each tick. The
+    // WatchdogReceiver (manifest-registered) wakes the process, reads the
+    // armpref + heartbeat from disk, and revives the service if it's stale —
+    // which catches crashes and low-memory kills. If the user stops
+    // monitoring we disarm (clear the armpref) so the alarm is a no-op.
+
+    private void armWatchdog() {
+        if (mPrefs == null) {
+            return;
+        }
+        mPrefs.edit()
+                .putBoolean(PREF_WATCHDOG_ARMED, true)
+                .putLong(PREF_HEARTBEAT_TS, SystemClock.elapsedRealtime())
+                .commit();
+        try {
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            PendingIntent pi = watchdogPendingIntent();
+            if (am != null) {
+                am.cancel(pi);
+                am.setRepeating(AlarmManager.RTC_WAKEUP,
+                        System.currentTimeMillis() + WATCHDOG_PERIOD_MS,
+                        WATCHDOG_PERIOD_MS, pi);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "watchdog arm failed", e);
+        }
+    }
+
+    private void disarmWatchdog() {
+        if (mPrefs == null) {
+            return;
+        }
+        try {
+            mPrefs.edit().putBoolean(PREF_WATCHDOG_ARMED, false).commit();
+            AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (am != null) {
+                am.cancel(watchdogPendingIntent());
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "watchdog disarm failed", e);
+        }
+    }
+
+    private PendingIntent watchdogPendingIntent() {
+        Intent in = new Intent(ACTION_WATCHDOG).setPackage(getPackageName());
+        return PendingIntent.getBroadcast(this, 0x2701, in,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
     }
 
     private void tickOnce() {
@@ -429,6 +518,7 @@ public final class MotionWakeService extends Service implements MotionCameraMana
                 + "\"threshold\":" + jsonNumber(
                         mPrefs.getFloat(PREF_THRESHOLD, DEFAULT_THRESHOLD)) + ","
                 + "\"check_seconds\":" + checkSecondsFromPrefs(mPrefs) + ","
+                + "\"confirm_cycles\":" + confirmCyclesFromPrefs(mPrefs) + ","
                 + "\"auto_start\":" + mPrefs.getBoolean(PREF_AUTO_START, true)
                 + "}";
     }
@@ -1333,24 +1423,31 @@ public final class MotionWakeService extends Service implements MotionCameraMana
 
     /**
      * Accepts a flat JSON body with a subset of
-     * {"idle_minutes":n,"threshold":f,"check_seconds":n}; applies the
-     * present-and-valid keys. Returns settingsJson() on success.
+     * {"idle_minutes":n,"threshold":f,"check_seconds":n,"confirm_cycles":n,
+     *  "auto_start":bool}; applies the present-and-valid keys.
+     * Returns settingsJson() on success.
      */
     public String apiSetSettings(String json) {
         Double idle = numFromJson(json, "idle_minutes");
         Double threshold = numFromJson(json, "threshold");
         Double check = numFromJson(json, "check_seconds");
-        if (idle == null && threshold == null && check == null) {
+        Double confirm = numFromJson(json, "confirm_cycles");
+        Boolean autoStart = boolFromJson(json, "auto_start");
+        if (idle == null && threshold == null && check == null
+                && confirm == null && autoStart == null) {
             return "{\"ok\":false,\"error\":\"no recognized keys "
-                    + "(idle_minutes, threshold, check_seconds)\"}";
+                    + "(idle_minutes, threshold, check_seconds, confirm_cycles, "
+                    + "auto_start)\"}";
         }
         boolean badRange = (idle != null && (idle < 1 || idle > 1440))
                 || (threshold != null && (threshold < MIN_THRESHOLD || threshold > MAX_THRESHOLD))
-                || (check != null && (check < MIN_CHECK_SECONDS || check > MAX_CHECK_SECONDS));
+                || (check != null && (check < MIN_CHECK_SECONDS || check > MAX_CHECK_SECONDS))
+                || (confirm != null && (confirm < MIN_CONFIRM_CYCLES || confirm > MAX_CONFIRM_CYCLES));
         if (badRange) {
             return "{\"ok\":false,\"error\":\"value out of range "
                     + "(idle 1-1440, threshold " + MIN_THRESHOLD + "-" + MAX_THRESHOLD
-                    + ", check " + MIN_CHECK_SECONDS + "-" + MAX_CHECK_SECONDS + ")\"}";
+                    + ", check " + MIN_CHECK_SECONDS + "-" + MAX_CHECK_SECONDS
+                    + ", confirm " + MIN_CONFIRM_CYCLES + "-" + MAX_CONFIRM_CYCLES + ")\"}";
         }
         SharedPreferences.Editor editor = mPrefs.edit();
         if (idle != null) {
@@ -1361,6 +1458,12 @@ public final class MotionWakeService extends Service implements MotionCameraMana
         }
         if (check != null) {
             editor.putLong(PREF_CHECK_SECONDS, check.longValue());
+        }
+        if (confirm != null) {
+            editor.putInt(PREF_CONFIRM_CYCLES, confirm.intValue());
+        }
+        if (autoStart != null) {
+            editor.putBoolean(PREF_AUTO_START, autoStart);
         }
         editor.apply();
         return settingsJson();
@@ -1632,6 +1735,32 @@ public final class MotionWakeService extends Service implements MotionCameraMana
             i++;
         }
         return i;
+    }
+
+    /** Minimal flat-JSON boolean extractor for the API (true/false literals). */
+    private static Boolean boolFromJson(String json, String key) {
+        if (json == null) {
+            return null;
+        }
+        String needle = "\"" + key + "\"";
+        int i = json.indexOf(needle);
+        if (i < 0) {
+            return null;
+        }
+        i += needle.length();
+        int n = json.length();
+        i = skipWs(json, i);
+        if (i >= n || json.charAt(i) != ':') {
+            return null;
+        }
+        i = skipWs(json, i + 1);
+        if (json.startsWith("true", i)) {
+            return Boolean.TRUE;
+        }
+        if (json.startsWith("false", i)) {
+            return Boolean.FALSE;
+        }
+        return null;
     }
 
     // ------------------------------------------------------------ API token

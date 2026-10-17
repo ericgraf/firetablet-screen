@@ -222,5 +222,16 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!-- Self-revival: the service arms this alarm while monitoring; the
+             receiver fires the BootStarter path when the heartbeat on disk
+             goes stale (process kill while monitoring). -->
+        <receiver
+            android:name=".WatchdogReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.egraf.motionwake.action.WATCHDOG" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

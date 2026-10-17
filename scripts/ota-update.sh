@@ -2,9 +2,9 @@
 # OTA update for MotionWake — ships the current APK to the Fire tablets over
 # the LAN, no USB cable needed for the install itself.
 #
-#   ./scripts/ota-update.sh                    # update both known tablets
+#   ./scripts/ota-update.sh                    # update all known tablets (A B C)
+#   ./scripts/ota-update.sh C                  # just C (Fire-3)
 #   ./scripts/ota-update.sh 192.168.48.36      # just B
-#   ./scripts/ota-update.sh 192.168.48.187     # just A
 #
 # HOW IT WORKS (empirically proven on this Fire build, 2026-10-15)
 # -----------------------------------------------------------------
@@ -41,10 +41,11 @@ APK="$ROOT/app/build/outputs/apk/release/app-release.apk"
 [ -f "$APK" ] || APK="$ROOT/app/build/outputs/apk/debug/app-debug.apk"
 [ -f "$APK" ] || { echo "No APK found — run ./scripts/build.sh first"; exit 1; }
 
-# name|ip|usb-serial|token — the two known tablets
+# name|ip|usb-serial|token — the known tablets
 TABLETS=(
   "A|192.168.48.187|GN41XE033142076C|2323353392f614aaeef9507762f742be"
   "B|192.168.48.36|GN41XE03314207GG|af9207f2943857162fcc9f2ec7ebbbb3"
+  "C|192.168.50.175|GN41XE03314205D3|c98e7ec38a852a3fac43ec6f81a03e3f"
 )
 
 TARGETS=()

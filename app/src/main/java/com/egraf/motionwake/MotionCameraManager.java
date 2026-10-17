@@ -54,15 +54,19 @@ final class MotionCameraManager {
     private static final long MIN_INTERVAL_MS = 2000L;
     private static final long MAX_INTERVAL_MS = 30000L;
     // per-cycle timing
-    private static final long SETTLE_MS = 1000L;      // auto-exposure settling before the grab
+    private static final long SETTLE_MS = 650L;      // auto-exposure settling before the grab
     private static final long OPEN_TIMEOUT_MS = 2000L;
     private static final long CONFIG_TIMEOUT_MS = 2500L;
     // failure pacing: retry sooner than the normal interval, capped
     private static final long FAIL_BASE_MS = 2000L;
     private static final long FAIL_MAX_MS = 15000L;
     private static final float FAIL_BACKOFF = 1.6f;
-    // motion decision
-    private static final int CONFIRM_CYCLES = 2;
+    // motion decision — how many consecutive crossing checks count as motion.
+    // Default 2 (noise-safe); 1 = most reactive (fine with a threshold well
+    // above the scene's standstill floor, e.g. the Fire-3 scene).
+    static final int DEFAULT_CONFIRM_CYCLES = 2;
+    static final int MIN_CONFIRM_CYCLES = 1;
+    static final int MAX_CONFIRM_CYCLES = 5;
     private static final int WARMUP_CYCLES = 2;
     // luma grid for differencing (multiple of 4 on both axes)
     private static final int GRID_W = 96;
@@ -83,6 +87,7 @@ final class MotionCameraManager {
     private volatile boolean mRunning = false;
     private volatile long mIntervalMs = DEFAULT_INTERVAL_MS;
     private volatile float mThreshold = MotionWakeService.DEFAULT_THRESHOLD;
+    private volatile int mConfirmCycles = DEFAULT_CONFIRM_CYCLES;
     private int mPhase = PHASE_IDLE; // camera thread only
 
     // decision state — camera thread only
@@ -138,6 +143,14 @@ final class MotionCameraManager {
 
     void setIntervalMs(long v) {
         mIntervalMs = Math.max(MIN_INTERVAL_MS, Math.min(MAX_INTERVAL_MS, v));
+    }
+
+    int getConfirmCycles() {
+        return mConfirmCycles;
+    }
+
+    void setConfirmCycles(int n) {
+        mConfirmCycles = Math.max(MIN_CONFIRM_CYCLES, Math.min(MAX_CONFIRM_CYCLES, n));
     }
 
     synchronized void start() {
@@ -371,7 +384,7 @@ final class MotionCameraManager {
                         mCycleCount, diff, mThreshold));
                 if (diff >= mThreshold) {
                     mConfirmed++;
-                    if (mConfirmed >= CONFIRM_CYCLES) {
+                    if (mConfirmed >= mConfirmCycles) {
                         mConfirmed = 0;
                         Log.i(TAG, "MOTION DETECTED (diff="
                                 + String.format(Locale.US, "%.2f", diff) + ")");
