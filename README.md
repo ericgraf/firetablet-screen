@@ -69,10 +69,39 @@ androidx.core 1.13.1 (only library dependency).
    adb shell am start-foreground-service -n com.egraf.motionwake/.MotionWakeService
    ```
 
+## Onboarding an ex-Fully-kiosk device (D/E, 2026-10-16)
+
+The D and E tablets arrived with the Fully kiosk app installed. Two build
+quirks made removal non-obvious; both are now fixed and the fleet pattern:
+
+- **Uninstalling Fully while its admin is live**: `pm uninstall de.ozerov.fully`
+  fails with `DELETE_FAILED_DEVICE_POLICY_MANAGER`, and `dpm
+  remove-active-admin` is a silent no-op on this build (its own
+  `getActiveAdmins(0)` returns an empty list, so the admin it tries to
+  remove "doesn't exist" — the record is still PMS-visible though, which is
+  what blocks the uninstall). Working path: disable the admin from the UI —
+  **Settings → Security → Device admin apps → toggle Fully Kiosk off** — then
+  `pm uninstall de.ozerov.fully` succeeds.
+- **Fire keyboard missing / wrong default IME**: `com.amazon.redstone`
+  (carries `FireKeyboardService`) can sit in a **per-user disabled** PMS
+  state (`enabled=3` in `pm dump`), so `ime enable
+  com.amazon.redstone/.FireKeyboardService` says "Unknown input method".
+  Fix: `pm enable com.amazon.redstone`, then
+  `ime enable com.amazon.redstone/.FireKeyboardService` and
+  `ime set com.amazon.redstone/.FireKeyboardService`. D/E arrived with
+  third-party defaults (AnySoftKeyboard / OpenWnn) — the fleet default is
+  the Amazon keyboard.
+- Then the standard flow: `./scripts/deploy.sh <serial>` over USB, `pm grant
+  CAMERA`, start the service, read the token (from the app UI —
+  `shared_prefs` is not world-readable), `POST /browser` + `POST /settings`
+  with the fleet profile (idle 10 min, threshold 1.5, check 2 s, confirm 2,
+  auto_start), add the `ota-update.sh` line and the HA config entry
+  (template: A/B/C).
+
 ## OTA updates over the LAN (no USB for the install)
 
 ```sh
-./scripts/ota-update.sh            # both known tablets (A + B)
+./scripts/ota-update.sh            # all fleet tablets (A B C E; D/F added at onboarding)
 ./scripts/ota-update.sh B          # one of them (by name or IP)
 ```
 
@@ -271,6 +300,7 @@ diffs real movement produces. Our fleet measured 2026-10-16:
 | A (192.168.48.187) | quiet p99 ≈2.1, people 2.3–3.7+ | **1.3** | 6 s |
 | B (192.168.48.36)  | noisier scene (live TV/reflections) | **1.2** | 4 s |
 | C Fire-3 (192.168.50.175) | absent/standstill 0.6–2.7, person moves 10–53 | **4.0** | 2 s |
+| E (192.168.48.103) | new: standstill 0.23–0.35 | **1.5** | 2 s |
 A handless test-room scene measures ~0.1–0.3. Failed checks (camera held by
 another app, timeouts) pace in with a 2 s → 15 s backoff and are skipped —
 they never produce a false motion event.

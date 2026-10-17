@@ -2,17 +2,44 @@
 
 ## Fleet status (as of 2026-10-16)
 
-| Tablet | Serial | IP | App | threshold | check | idle | Dashboard |
-|--------|--------|----|-----|-----------|-------|------|-----------|
-| A (Fire-1) | `GN41XE033142076C` | 192.168.48.187 | 2.6/17 | **1.3** | 6 s | 10 min | `http://silver:8123/wall-tablets/fire-6` (as `fire-1`) |
-| B (Fire-2) | `GN41XE03314207GG` | 192.168.48.36 | 2.6/17 | **1.2** | 4 s | 10 min | `http://silver:8123/wall-tablets/fire-6` (as `fire-1`) |
-| C (Fire-3) | `GN41XE03314205D3` | 192.168.50.175 | 2.6/17 | **4.0** | 2 s | 10 min | `http://silver:8123/wall-tablets/fire-3` (as `fire-3`) |
+| Tablet | Serial | IP | App | threshold | check | confirm | idle | Dashboard |
+|--------|--------|----|-----|-----------|-------|---------|------|-----------|
+| A (Fire-1) | `GN41XE033142076C` | 192.168.48.187 | 2.7/18 | **1.5** | 2 s | 2 | 10 min | `http://silver:8123/wall-tablets/fire-6` (as `fire-1`) |
+| B (Fire-2) | `GN41XE03314207GG` | 192.168.48.36 | 2.7/18 | **0.5** | 2 s | 2 | 10 min | `http://silver:8123/wall-tablets/fire-6` (as `fire-1`) |
+| C (Fire-3) | `GN41XE03314205D3` | 192.168.50.175 | 2.7/18 | **1.0** | 2 s | 1 | 10 min | `http://silver:8123/wall-tablets/fire-3` (as `fire-3`) |
+| D | `GCC1XE0323250SU3` | 192.168.50.99 | — | onboarding: user toggles off Fully admin in Settings UI, then standard flow | | | | |
+| E | `GN41XE03314207ER` | 192.168.48.103 | 2.7/18 | **1.5** | 2 s | 2 | 10 min | `http://silver:8123/wall-tablets/fire-6` |
 
 API tokens: A `2323353392f614aaeef9507762f742be`; B `af9207f2943857162fcc9f2ec7ebbbb3`;
-C `c98e7ec38a852a3fac43ec6f81a03e3f`.
-HA: all three config entries live (C entry_id `G4EUGVQJJU93U8SDKTRCMAD6C5`,
-unique_id `192.168.50.175:8587`). HA local user for C: `fire-3` / `firewall3`
-(asked user to change the password later in HA).
+C `c98e7ec38a852a3fac43ec6f81a03e3f`;
+E `92080024d61f1010437dc4696012bda6`.
+HA: config entries live for A, B, C (C entry_id `G4EUGVQJJU93U8SDKTRCMAD6C5`,
+unique_id `192.168.50.175:8587`) and E (entry_id `AFB1C0ADE99E4B99B33E29`,
+unique_id `192.168.48.103:8587`); D added at onboarding. HA local user for C:
+`fire-3` / `firewall3` (asked user to change the password later in HA).
+
+## Tablet E — onboarded DONE (2026-10-16)
+- [x] Fully kiosk (`de.ozerov.fully`) admin disabled by user via
+      Settings → Device admin apps (the only working removal path on this
+      build — `pm uninstall` blocked by PMS while the admin record exists,
+      `dpm remove-active-admin` a silent no-op since `getActiveAdmins(0)`
+      returns an empty list), then `pm uninstall de.ozerov.fully` succeeded.
+- [x] `./scripts/deploy.sh GN41XE03314207ER` (USB): v2.7/18, OTA slot, LAN adb
+      192.168.48.103:5555, perms, MwDeviceAdmin, home=DashboardBrowser,
+      MwA11y, keyguard dismissed.
+- [x] Keyboard fixed: `com.amazon.redstone` (FireKeyboardService) was in
+      per-user-disabled PMS state; `pm enable com.amazon.redstone` +
+      `ime enable/set com.amazon.redstone/.FireKeyboardService` (was on a
+      third-party default IME). Same fix on D.
+- [x] `pm grant CAMERA`; monitor running; healthy cycles (diff 0.23–0.35 vs
+      thr 1.5); A-profile settings applied (1.5/2 s/confirm 2/idle 10/
+      auto_start) + fire-6 dashboard URL; token read from app UI via
+      uiautomator (prefs not world-readable).
+- [x] `ota-update.sh` line added (E|192.168.48.103|GN41XE03314207ER|token);
+      HA config entry added on silver + HA restarted — 18 entities live
+      (incl. the new `number..._confirm_cycles` from integration v2.0.1).
+- [ ] Calibration pass: E is a quiet scene (standstill 0.23–0.35), threshold
+      1.5 is 4–6× the noise floor — room to tune per scene.
 
 ## Tablet C (Fire-3) — onboarded DONE (2026-10-16)
 - [x] Kiosk identified (Fully kiosk `de.ozerov.fully` + `com.baronkiko.launcherhijack`,
