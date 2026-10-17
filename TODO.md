@@ -1,22 +1,44 @@
 # MotionWake TODO
 
-## Fleet status (as of 2026-10-16)
+## Fleet status (as of 2026-10-17)
 
 | Tablet | Serial | IP | App | threshold | check | confirm | idle | Dashboard |
 |--------|--------|----|-----|-----------|-------|---------|------|-----------|
 | A (Fire-1) | `GN41XE033142076C` | 192.168.48.187 | 2.7/18 | **1.5** | 2 s | 2 | 10 min | `http://silver:8123/wall-tablets/fire-6` (as `fire-1`) |
 | B (Fire-2) | `GN41XE03314207GG` | 192.168.48.36 | 2.7/18 | **0.5** | 2 s | 2 | 10 min | `http://silver:8123/wall-tablets/fire-6` (as `fire-1`) |
 | C (Fire-3) | `GN41XE03314205D3` | 192.168.50.175 | 2.7/18 | **1.0** | 2 s | 1 | 10 min | `http://silver:8123/wall-tablets/fire-3` (as `fire-3`) |
-| D | `GCC1XE0323250SU3` | 192.168.50.99 | — | onboarding: user toggles off Fully admin in Settings UI, then standard flow | | | | |
+| D | `GCC1XE0323250SU3` | 192.168.50.99 | 2.7/18 | **1.5** | 2 s | 2 | 10 min | `http://silver:8123/wall-tablets/fire-6` |
 | E | `GN41XE03314207ER` | 192.168.48.103 | 2.7/18 | **1.5** | 2 s | 2 | 10 min | `http://silver:8123/wall-tablets/fire-6` |
 
 API tokens: A `2323353392f614aaeef9507762f742be`; B `af9207f2943857162fcc9f2ec7ebbbb3`;
 C `c98e7ec38a852a3fac43ec6f81a03e3f`;
+D `ed725e13227982b69acd2d72258990cd`;
 E `92080024d61f1010437dc4696012bda6`.
 HA: config entries live for A, B, C (C entry_id `G4EUGVQJJU93U8SDKTRCMAD6C5`,
-unique_id `192.168.50.175:8587`) and E (entry_id `AFB1C0ADE99E4B99B33E29`,
-unique_id `192.168.48.103:8587`); D added at onboarding. HA local user for C:
+unique_id `192.168.50.175:8587`), D (entry_id `755DE7BBD633493AB0DA38`,
+unique_id `192.168.50.99:8587`) and E (entry_id `AFB1C0ADE99E4B99B33E29`,
+unique_id `192.168.48.103:8587`). HA local user for C:
 `fire-3` / `firewall3` (asked user to change the password later in HA).
+
+## Tablet D — onboarded DONE (2026-10-17)
+- [x] Fully kiosk (`de.ozerov.fully`) admin toggled off by the user via
+      Settings → Device admin apps (the only working removal path on these
+      Fire builds), then `pm uninstall de.ozerov.fully` succeeded.
+- [x] `./scripts/deploy.sh GCC1XE0323250SU3` (USB): v2.7/18, OTA slot, LAN
+      adb 192.168.50.99:5555, perms, MwDeviceAdmin, home=DashboardBrowser,
+      MwA11y, keyguard dismissed.
+- [x] Keyboard fixed: `com.amazon.redstone` was in per-user-disabled PMS
+      state; `pm enable com.amazon.redstone` + `ime enable/set
+      com.amazon.redstone/.FireKeyboardService` (same fix as E).
+- [x] `pm grant CAMERA`; monitor running; healthy cycles (standstill
+      0.12–0.14 vs thr 1.5); A-profile settings applied (1.5/2 s/confirm
+      2/idle 10/auto_start) + fire-6 dashboard URL; token generated.
+- [x] `ota-update.sh` line added (D|192.168.50.99|GCC1XE0323250SU3|token);
+      HA config entry added on silver (`755DE7BBD633493AB0DA38`) + HA
+      restarted — 18 entities live (incl. `number..._confirm_cycles`).
+- [ ] Calibration pass: D is the quietest scene in the fleet
+      (standstill 0.12–0.14); thr 1.5 is ~10× the noise floor — room to
+      detect earlier if wanted.
 
 ## Tablet E — onboarded DONE (2026-10-16)
 - [x] Fully kiosk (`de.ozerov.fully`) admin disabled by user via

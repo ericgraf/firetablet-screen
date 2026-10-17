@@ -297,9 +297,10 @@ a threshold at least ~20% above that scene's p99 while staying below the
 diffs real movement produces. Our fleet measured 2026-10-16:
 | Tablet | Scene profile | threshold | check |
 |--------|---------------|-----------|-------|
-| A (192.168.48.187) | quiet p99 ≈2.1, people 2.3–3.7+ | **1.3** | 6 s |
-| B (192.168.48.36)  | noisier scene (live TV/reflections) | **1.2** | 4 s |
-| C Fire-3 (192.168.50.175) | absent/standstill 0.6–2.7, person moves 10–53 | **4.0** | 2 s |
+| A (192.168.48.187) | quiet p99 ≈2.1, people 2.3–3.7+ | **1.5** | 2 s |
+| B (192.168.48.36)  | noisier scene (live TV/reflections) | **0.5** | 2 s |
+| C Fire-3 (192.168.50.175) | absent/standstill 0.6–2.7, person moves 10–53 | **1.0** | 2 s |
+| D (192.168.50.99) | quiet: standstill 0.12–0.14 | **1.5** | 2 s |
 | E (192.168.48.103) | new: standstill 0.23–0.35 | **1.5** | 2 s |
 A handless test-room scene measures ~0.1–0.3. Failed checks (camera held by
 another app, timeouts) pace in with a 2 s → 15 s backoff and are skipped —
